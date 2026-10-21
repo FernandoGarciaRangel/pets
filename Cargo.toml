@@ -1,0 +1,43 @@
+[package]
+name = "pets"
+version = "0.1.0"
+edition = "2024"
+description = "Pets do Codex flutuando em qualquer tela do Windows, reagindo ao Claude Code e ao Codex."
+license = "MIT"
+repository = "https://github.com/FernandoGarciaSimpipe/pets"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["webp", "png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "1"
+
+[dependencies.windows-sys]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Decodificar e redimensionar a spritesheet em debug sem otimização leva segundos.
+[profile.dev.package."*"]
+opt-level = 3

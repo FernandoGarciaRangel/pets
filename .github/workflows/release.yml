@@ -1,0 +1,44 @@
+name: Release
+
+# Publica uma release ao criar uma tag v* (ex.: git tag v0.1.0 && git push origin v0.1.0).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Conferir versão da tag com o Cargo.toml
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "Tag $env:GITHUB_REF_NAME não bate com a versão $version do Cargo.toml"
+          }
+
+      - run: cargo test --release
+      - run: cargo build --release
+
+      - name: Empacotar
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/pets.exe dist/pets.exe
+          Compress-Archive -Path dist/pets.exe, README.md, LICENSE -DestinationPath "dist/pets-$env:GITHUB_REF_NAME-windows-x64.zip"
+          Get-ChildItem dist -File | ForEach-Object {
+            "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content dist/SHA256SUMS.txt
+
+      - name: Publicar release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME dist/* --title "Pets $env:GITHUB_REF_NAME" --generate-notes
