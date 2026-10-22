@@ -3,9 +3,11 @@
 
 mod agents;
 mod animation;
+mod catalog;
 mod config;
 mod hook;
 mod install;
+mod net;
 mod pets;
 mod sprite;
 mod system;
@@ -37,16 +39,22 @@ fn main() {
             update::CheckResult::Failed(e) => Err(e),
         }),
         Some("update") => cli(update::update_now()),
+        Some("check-pets") => cli(Ok(catalog::report(&local_pets()))),
+        Some("update-pets") => cli(catalog::update_all(&local_pets())),
         Some("install-hooks") => cli(install::install()),
         Some("uninstall-hooks") => cli(install::uninstall()),
         Some(other) if other.starts_with('-') || other == "help" => {
             system::attach_console();
             println!(
-                "uso: pets [install | update | check-update | install-hooks | uninstall-hooks | hook <claude|codex>]"
+                "uso: pets [install | update | check-update | check-pets | update-pets | install-hooks | uninstall-hooks | hook <claude|codex>]"
             );
         }
         _ => window::run(),
     }
+}
+
+fn local_pets() -> Vec<pets::PetInfo> {
+    pets::discover(&config::Config::load().pets_dir())
 }
 
 fn cli(result: Result<String, String>) {

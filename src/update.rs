@@ -1,14 +1,12 @@
 //! Atualização pelo GitHub Releases: checa a última release, baixa o `pets.exe`, confere o SHA-256
 //! com o `SHA256SUMS.txt` da mesma release e entrega a instalação ao `pets.exe install` baixado.
-//! HTTP via WinHTTP e hash via BCrypt, ambos do Windows, para não puxar crates de rede/TLS.
 
+use crate::net::{get as http_get, sha256_hex};
 use std::path::PathBuf;
-use std::ptr::{null, null_mut};
 
 const REPO: &str = "FernandoGarciaRangel/pets";
 const EXE_ASSET: &str = "pets.exe";
 const SUMS_ASSET: &str = "SHA256SUMS.txt";
-const MAX_DOWNLOAD: usize = 32 * 1024 * 1024;
 pub const CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -125,134 +123,6 @@ pub fn staging_dir() -> PathBuf {
     std::env::temp_dir().join("pets-update")
 }
 
-fn sha256_hex(data: &[u8]) -> Result<String, String> {
-    use windows_sys::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
-    let mut out = [0u8; 32];
-    // SAFETY: buffers válidos com os tamanhos informados.
-    let status = unsafe {
-        BCryptHash(
-            BCRYPT_SHA256_ALG_HANDLE,
-            null(),
-            0,
-            data.as_ptr(),
-            data.len() as u32,
-            out.as_mut_ptr(),
-            out.len() as u32,
-        )
-    };
-    if status != 0 {
-        return Err(format!("BCryptHash falhou: 0x{status:08x}"));
-    }
-    Ok(out.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// GET HTTPS com WinHTTP (segue redirects https→https, que o GitHub usa para os assets).
-fn http_get(url: &str) -> Result<Vec<u8>, String> {
-    use crate::system::wide;
-    use windows_sys::Win32::Networking::WinHttp::*;
-
-    let rest = url
-        .strip_prefix("https://")
-        .ok_or_else(|| format!("URL não é https: {url}"))?;
-    let (host, path) = rest
-        .split_once('/')
-        .map_or((rest, "/".to_string()), |(h, p)| (h, format!("/{p}")));
-
-    struct Handle(*mut core::ffi::c_void);
-    impl Drop for Handle {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                // SAFETY: handle WinHTTP aberto por nós.
-                unsafe { WinHttpCloseHandle(self.0) };
-            }
-        }
-    }
-    let fail = |what: &str| {
-        // SAFETY: sem pré-condições.
-        let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-        format!("{what} falhou (erro {code}) em {url}")
-    };
-
-    let agent = wide(&format!("pets/{}", current_version()));
-    let (host_w, path_w, verb) = (wide(host), wide(&path), wide("GET"));
-    // SAFETY: strings terminadas em NUL; handles fechados pelo Drop na ordem inversa.
-    unsafe {
-        let session = Handle(WinHttpOpen(
-            agent.as_ptr(),
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-            null(),
-            null(),
-            0,
-        ));
-        if session.0.is_null() {
-            return Err(fail("WinHttpOpen"));
-        }
-        WinHttpSetTimeouts(session.0, 10_000, 10_000, 15_000, 30_000);
-        let connect = Handle(WinHttpConnect(
-            session.0,
-            host_w.as_ptr(),
-            INTERNET_DEFAULT_HTTPS_PORT,
-            0,
-        ));
-        if connect.0.is_null() {
-            return Err(fail("WinHttpConnect"));
-        }
-        let request = Handle(WinHttpOpenRequest(
-            connect.0,
-            verb.as_ptr(),
-            path_w.as_ptr(),
-            null(),
-            null(),
-            null(),
-            WINHTTP_FLAG_SECURE,
-        ));
-        if request.0.is_null() {
-            return Err(fail("WinHttpOpenRequest"));
-        }
-        if WinHttpSendRequest(request.0, null(), 0, null(), 0, 0, 0) == 0 {
-            return Err(fail("conexão"));
-        }
-        if WinHttpReceiveResponse(request.0, null_mut()) == 0 {
-            return Err(fail("resposta"));
-        }
-        let mut status = 0u32;
-        let mut len = size_of::<u32>() as u32;
-        WinHttpQueryHeaders(
-            request.0,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            null(),
-            (&mut status as *mut u32).cast(),
-            &mut len,
-            null_mut(),
-        );
-        if status != 200 {
-            return Err(format!("HTTP {status} em {url}"));
-        }
-        let mut body = Vec::new();
-        let mut chunk = vec![0u8; 64 * 1024];
-        loop {
-            let mut read = 0u32;
-            if WinHttpReadData(
-                request.0,
-                chunk.as_mut_ptr().cast(),
-                chunk.len() as u32,
-                &mut read,
-            ) == 0
-            {
-                return Err(fail("leitura"));
-            }
-            if read == 0 {
-                break;
-            }
-            body.extend_from_slice(&chunk[..read as usize]);
-            if body.len() > MAX_DOWNLOAD {
-                return Err(format!("download maior que o limite em {url}"));
-            }
-        }
-        Ok(body)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,13 +155,5 @@ mod tests {
         let sums = "\u{feff}AAA  pets-v0.1.0-windows-x64.zip\r\nBBB  pets.exe\r\n";
         assert_eq!(expected_hash(sums, "pets.exe").as_deref(), Some("bbb"));
         assert_eq!(expected_hash(sums, "outro.exe"), None);
-    }
-
-    #[test]
-    fn sha256_matches_known_vector() {
-        assert_eq!(
-            sha256_hex(b"abc").unwrap(),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
     }
 }

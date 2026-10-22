@@ -3,6 +3,7 @@
 
 use crate::agents::{self, HookEvent, Sessions};
 use crate::animation::{self, AgentState, Drag};
+use crate::catalog::{self, PetUpdate};
 use crate::config::{Config, DEFAULT_WIDTH, MAX_WIDTH, MIN_WIDTH};
 use crate::install;
 use crate::pets::{self, PetInfo};
@@ -62,6 +63,8 @@ const ID_OPEN_DIR: u32 = 14;
 const ID_UPDATE: u32 = 15;
 const ID_CHECK_UPDATE: u32 = 16;
 const ID_AUTO_UPDATE: u32 = 17;
+const ID_PET_UPDATE_ALL: u32 = 19;
+const ID_PET_UPDATE_BASE: u32 = 3000;
 const ID_QUIT: u32 = 99;
 const ID_PET_BASE: u32 = 1000;
 const ID_SIZE_RESET: u32 = 18;
@@ -139,12 +142,23 @@ enum Outcome {
     /// Caixa de mensagem: modal, então só depois de soltar o App.
     Message(String, bool),
     ConfirmUpdate(String),
+    /// Pergunta se aplica as atualizações de pets; o texto já vem montado.
+    ConfirmPetUpdates(String),
 }
 
 /// Resultado das threads de atualização, entregue via `WM_APP_UPDATE`.
 enum UpdateMsg {
-    Checked { result: CheckResult, manual: bool },
+    Checked {
+        result: CheckResult,
+        manual: bool,
+    },
     Downloaded(Result<PathBuf, String>),
+    PetsChecked {
+        updates: Vec<PetUpdate>,
+        manual: bool,
+    },
+    /// (label, resultado) de cada pet aplicado.
+    PetsApplied(Vec<(String, String, Result<(), String>)>),
 }
 
 enum After {
@@ -173,6 +187,9 @@ struct App {
     notified_version: Option<String>,
     updating: bool,
     resize_cells: Option<Cells>,
+    pet_updates: Vec<PetUpdate>,
+    notified_pets: Vec<String>,
+    updating_pets: bool,
 }
 
 pub fn run() {
@@ -295,6 +312,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 system::message_box(&text, error);
                 0
             }
+            Some(Outcome::ConfirmPetUpdates(question)) => {
+                if system::confirm(&question) {
+                    with_app(|app| app.start_pet_updates(None));
+                }
+                0
+            }
             Some(Outcome::ConfirmUpdate(version)) => {
                 let question = format!(
                     "Pets v{version} está disponível (você tem v{}).\n\nAtualizar agora?",
@@ -400,12 +423,15 @@ fn post_update(hwnd: isize, msg: UpdateMsg) {
 }
 
 /// Checa o GitHub numa thread (rede bloqueante não pode rodar na thread da janela).
-fn spawn_check(hwnd: HWND, manual: bool, delay: Duration) {
+/// Depois do app, checa os pets nos catálogos (é mais lento: uma requisição por pet).
+fn spawn_check(hwnd: HWND, manual: bool, delay: Duration, pets: Vec<PetInfo>) {
     let hwnd = hwnd as isize;
     std::thread::spawn(move || {
         std::thread::sleep(delay);
         let result = update::check();
         post_update(hwnd, UpdateMsg::Checked { result, manual });
+        let updates = catalog::updates(&pets);
+        post_update(hwnd, UpdateMsg::PetsChecked { updates, manual });
     });
 }
 
@@ -441,6 +467,9 @@ impl App {
             notified_version: None,
             updating: false,
             resize_cells: None,
+            pet_updates: Vec::new(),
+            notified_pets: Vec::new(),
+            updating_pets: false,
             cfg,
         }
     }
@@ -458,7 +487,7 @@ impl App {
         // Sobra de uma atualização anterior.
         let _ = std::fs::remove_dir_all(update::staging_dir());
         if self.cfg.check_updates {
-            spawn_check(self.hwnd, false, Duration::from_secs(10));
+            spawn_check(self.hwnd, false, Duration::from_secs(10), self.pets.clone());
         }
         // SAFETY: timer da nossa janela.
         unsafe {
@@ -469,6 +498,47 @@ impl App {
                 None,
             )
         };
+    }
+
+    /// Aplica numa thread as atualizações de pets: todas (`None`) ou a de índice `only`.
+    fn start_pet_updates(&mut self, only: Option<usize>) {
+        if self.updating_pets {
+            return;
+        }
+        let chosen: Vec<(PetUpdate, PathBuf)> = self
+            .pet_updates
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| only.is_none_or(|o| o == *i))
+            .filter_map(|(_, u)| {
+                let dir = self.pets.iter().find(|p| p.id == u.id)?.dir.clone();
+                Some((u.clone(), dir))
+            })
+            .collect();
+        if chosen.is_empty() {
+            return;
+        }
+        self.updating_pets = true;
+        let hwnd = self.hwnd as isize;
+        std::thread::spawn(move || {
+            let results = chosen
+                .iter()
+                .map(|(u, dir)| (u.id.clone(), u.label.clone(), catalog::apply(dir, u)))
+                .collect();
+            post_update(hwnd, UpdateMsg::PetsApplied(results));
+        });
+    }
+
+    fn pet_updates_question(&self) -> String {
+        let names: Vec<String> = self
+            .pet_updates
+            .iter()
+            .map(|u| format!("• {} ({})", u.label, u.remote.source.label()))
+            .collect();
+        format!(
+            "Há versão nova destes pets:\n\n{}\n\nAtualizar agora? Os arquivos atuais ficam em backup.",
+            names.join("\n")
+        )
     }
 
     fn start_download(&mut self) {
@@ -523,6 +593,54 @@ impl App {
                 CheckResult::Failed(e) => eprintln!("[update] {e}"),
                 CheckResult::UpToDate => {}
             },
+            UpdateMsg::PetsChecked { updates, manual } => {
+                self.pet_updates = updates;
+                if self.pet_updates.is_empty() {
+                    return Outcome::Handled(0);
+                }
+                if manual {
+                    return Outcome::ConfirmPetUpdates(self.pet_updates_question());
+                }
+                // Avisa só quando aparece pet novo na lista.
+                let ids: Vec<String> = self.pet_updates.iter().map(|u| u.id.clone()).collect();
+                if ids.iter().any(|id| !self.notified_pets.contains(id)) {
+                    let first = &self.pet_updates[0].label;
+                    let text = match self.pet_updates.len() {
+                        1 => format!("{first} tem versão nova. Clique aqui para atualizar."),
+                        n => format!(
+                            "{first} e mais {} têm versão nova. Clique aqui para atualizar.",
+                            n - 1
+                        ),
+                    };
+                    self.tray.notify("Atualização de pets", &text);
+                    self.notified_pets = ids;
+                }
+            }
+            UpdateMsg::PetsApplied(results) => {
+                self.updating_pets = false;
+                let mut failures = Vec::new();
+                let mut reload = false;
+                for (id, label, result) in results {
+                    match result {
+                        Ok(()) => {
+                            self.pet_updates.retain(|u| u.id != id);
+                            reload |= self.cfg.pet.as_deref() == Some(id.as_str());
+                        }
+                        Err(e) => failures.push(format!("• {label}: {e}")),
+                    }
+                }
+                // Nome e descrição podem ter mudado.
+                self.pets = pets::discover(&self.cfg.pets_dir());
+                if reload {
+                    self.load_pet();
+                }
+                if !failures.is_empty() {
+                    return Outcome::Message(
+                        format!("Alguns pets não atualizaram:\n\n{}", failures.join("\n")),
+                        true,
+                    );
+                }
+            }
             UpdateMsg::Downloaded(Ok(path)) => {
                 // O exe baixado roda `install`: fecha este pet, troca o exe instalado e sobe de novo.
                 if let Err(e) = install::spawn_detached(&path, &["install", "--from-update"]) {
@@ -892,7 +1010,7 @@ impl App {
                 TIMER_FRAME => self.next_frame(),
                 TIMER_STATE => self.refresh_state(),
                 TIMER_UPDATE if self.cfg.check_updates => {
-                    spawn_check(self.hwnd, false, Duration::ZERO)
+                    spawn_check(self.hwnd, false, Duration::ZERO, self.pets.clone())
                 }
                 TIMER_UPDATE => {}
                 TIMER_RESIZE => self.finish_resize(),
@@ -917,6 +1035,9 @@ impl App {
                         && !self.updating
                     {
                         return Outcome::ConfirmUpdate(release.version.clone());
+                    }
+                    if !self.pet_updates.is_empty() && !self.updating_pets {
+                        return Outcome::ConfirmPetUpdates(self.pet_updates_question());
                     }
                 }
                 _ => {}
@@ -1003,6 +1124,26 @@ impl App {
                     MF_STRING,
                     ID_UPDATE,
                     &format!("Atualizar para v{}", release.version),
+                );
+            }
+            if self.updating_pets {
+                append(menu, MF_STRING | MF_GRAYED, 0, "Atualizando pets…");
+            } else if !self.pet_updates.is_empty() {
+                let pets_menu = CreatePopupMenu();
+                for (i, u) in self.pet_updates.iter().enumerate() {
+                    append(
+                        pets_menu,
+                        MF_STRING,
+                        ID_PET_UPDATE_BASE + i as u32,
+                        &format!("{} ({})", u.label, u.remote.source.label()),
+                    );
+                }
+                append(pets_menu, MF_SEPARATOR, 0, "");
+                append(pets_menu, MF_STRING, ID_PET_UPDATE_ALL, "Atualizar todos");
+                append_submenu(
+                    menu,
+                    pets_menu,
+                    &format!("Atualizar pets ({})", self.pet_updates.len()),
                 );
             }
             append(menu, MF_SEPARATOR, 0, "");
@@ -1114,7 +1255,13 @@ impl App {
                 };
             }
             ID_UPDATE => self.start_download(),
-            ID_CHECK_UPDATE => spawn_check(self.hwnd, true, Duration::ZERO),
+            ID_PET_UPDATE_ALL => self.start_pet_updates(None),
+            id if (ID_PET_UPDATE_BASE..ID_PET_UPDATE_BASE + self.pet_updates.len() as u32)
+                .contains(&id) =>
+            {
+                self.start_pet_updates(Some((id - ID_PET_UPDATE_BASE) as usize))
+            }
+            ID_CHECK_UPDATE => spawn_check(self.hwnd, true, Duration::ZERO, self.pets.clone()),
             ID_AUTO_UPDATE => {
                 self.cfg.check_updates = !self.cfg.check_updates;
                 self.cfg.save();

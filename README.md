@@ -47,6 +47,20 @@ pets.exe check-update   # só consulta
 pets.exe update         # consulta, baixa e instala
 ```
 
+## Atualização dos pets
+
+Pets instalados de **codex-pets.net**, **petdex.dev** ou **aimcp.info** (repositório
+[awesome-codex-pet](https://github.com/legeling/awesome-codex-pet)) recebem as versões novas que os autores publicam.
+Na primeira checagem cada pet é identificado pelo spritesheet idêntico ao do catálogo; pets criados localmente ou
+diferentes do catálogo ficam de fora e nunca são substituídos. Quando sai versão nova, o menu mostra
+**Atualizar pets (N)**; antes de trocar, o app valida a imagem nova e guarda os arquivos antigos em
+`%APPDATA%\petsackups`.
+
+```powershell
+pets.exe check-pets    # situação de cada pet
+pets.exe update-pets   # aplica as versões novas
+```
+
 ## Pets
 
 Qualquer pasta em `~/.codex/pets` com um `pet.json` vira um pet. Sem layout no manifest, vale o grid do Codex:

@@ -18,7 +18,7 @@ cargo fmt --check; cargo clippy --all-targets -- -D warnings   # CI requires bot
 
 Always start services in the current terminal with `dev.ps1`. Never open an external window, because the logs would be lost.
 
-CLI modes (`src/main.rs`): with no arguments the app runs; `hook <claude|codex>`, `install`, `update`, `check-update`, `install-hooks` and `uninstall-hooks` are the other modes.
+CLI modes (`src/main.rs`): with no arguments the app runs; `hook <claude|codex>`, `install`, `update`, `check-update`, `check-pets`, `update-pets`, `install-hooks` and `uninstall-hooks` are the other modes.
 
 ## Architecture
 
@@ -56,6 +56,15 @@ Updates (`update.rs`):
 - Updating downloads the `pets.exe` asset, verifies it against `SHA256SUMS.txt` (using BCrypt), saves it to `%TEMP%\pets-update`, and runs `<downloaded> install --from-update` detached. That reuses `install_app`: it quits the current instance, swaps the exe, reinstalls the hooks and starts the app again.
 - `pets.exe update` / `check-update` run the same path from the CLI, which is the way to test without the GUI. To simulate an old version, build with a lower `version` in `Cargo.toml` and a separate `CARGO_TARGET_DIR`.
 - The release asset names (`pets.exe`, `SHA256SUMS.txt`) are a contract between `release.yml` and `update.rs`.
+
+Pet updates (`catalog.rs`):
+- The sources are codex-pets.net (`/api/pets/<id>/share-data`, one request per pet), petdex.dev (the public manifest `assets.petdex.dev/manifests/petdex-v1.json`) and awesome-codex-pet, the GitHub repo behind aimcp.info (fetched through the git tree API; folders are `<id>--<author>`).
+- A local pet only gets updates once it is **identified exactly**, meaning its spritesheet matches a catalog entry: same size on codex-pets (`spritesheetBytes`), the same `Content-Length` via HEAD on petdex, or the same git blob SHA-1 on GitHub.
+- What is known about each pet lives in `%APPDATA%\pets\pet-sources.json`: `tracked` with source, key and version, or `unmatched` with size and whether the name exists in some catalog.
+- The version marker is the `v` in the URL on codex-pets, the spritesheet URL (which carries a hash) on petdex, and the blob SHA on GitHub.
+- `apply` downloads the new version, validates it with `Cells::load` in `%APPDATA%\pets\staging`, backs up the old files to `backups/<id>-<ts>`, then swaps the files while keeping the local `id`.
+- The check runs in the same thread as the app check (`spawn_check`) and returns as `UpdateMsg::PetsChecked`.
+- From the CLI: `check-pets` / `update-pets`. The network test is `cargo test awesome_codex_pet_end_to_end -- --ignored`.
 
 Config lives in `%APPDATA%\pets\config.toml` (`config.rs`).
 
