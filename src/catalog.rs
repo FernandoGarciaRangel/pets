@@ -43,11 +43,15 @@ impl Source {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 enum Known {
-    /// `key` é o id no catálogo e `version` o marcador da versão instalada.
+    /// `key` é o id no catálogo e `version` o marcador da versão instalada. `size` é o tamanho
+    /// do spritesheet local nesse momento: se mudar, o usuário editou o pet e ele não é mais
+    /// atualizado (0 = estado antigo, sem essa informação).
     Tracked {
         source: Source,
         key: String,
         version: String,
+        #[serde(default)]
+        size: u64,
     },
     /// Não bateu com nenhum catálogo; só tenta de novo se o spritesheet mudar de tamanho.
     /// `seen`: o nome existe em algum catálogo, mas com outro spritesheet.
@@ -121,6 +125,8 @@ pub enum Status {
     UpdateAvailable(Source),
     /// Existe com o mesmo nome em algum catálogo, mas o spritesheet não é igual.
     Different,
+    /// Foi identificado, mas o spritesheet local mudou depois: é do usuário agora.
+    EditedLocally,
     NotInCatalogs,
     Error(String),
 }
@@ -135,8 +141,10 @@ fn is_slug(id: &str) -> bool {
 /// Marcador de versão do codex-pets: o `v` de `downloadUrl` (`?v=…`) ou de `/v/<n>/` no spritesheet.
 fn codex_pets_version(pet: &Value) -> Option<String> {
     let from_query = pet["downloadUrl"].as_str().and_then(|u| {
-        u.split_once("v=")
-            .map(|(_, v)| v.split('&').next().unwrap_or(v))
+        u.split_once('?')?
+            .1
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("v="))
     });
     let from_path = || {
         let url = pet["spritesheetUrl"].as_str()?;
@@ -296,43 +304,72 @@ fn lookup(catalogs: &mut Catalogs, source: Source, key: &str) -> Result<Option<R
 
 /// Procura a entrada cujo spritesheet é idêntico ao local. `seen` vira true se o nome existe em
 /// algum catálogo (para distinguir "diferente" de "não está em nenhum").
-fn identify(catalogs: &mut Catalogs, id: &str, sheet: &[u8], seen: &mut bool) -> Option<Remote> {
+/// Resultado de procurar um pet nos três catálogos.
+struct Identified {
+    remote: Option<Remote>,
+    /// O nome existe em algum catálogo (para distinguir "diferente" de "não está em nenhum").
+    seen: bool,
+    /// Algum catálogo não respondeu: um "não achei" não é definitivo.
+    failed: bool,
+}
+
+/// Procura a entrada cujo spritesheet é idêntico ao local.
+fn identify(catalogs: &mut Catalogs, id: &str, sheet: &[u8]) -> Identified {
     let size = sheet.len() as u64;
-    if let Ok(Some(remote)) = codex_pets_lookup(id) {
-        *seen = true;
-        if remote.sheet_size == Some(size) {
-            return Some(remote);
+    let mut found = Identified {
+        remote: None,
+        seen: false,
+        failed: false,
+    };
+    match codex_pets_lookup(id) {
+        Ok(Some(remote)) => {
+            found.seen = true;
+            if remote.sheet_size == Some(size) {
+                found.remote = Some(remote);
+                return found;
+            }
         }
+        Ok(None) => {}
+        Err(_) => found.failed = true,
     }
-    if let Ok(list) = catalogs.petdex() {
-        let candidates: Vec<Remote> = list.iter().filter(|r| r.key == id).cloned().collect();
-        for remote in candidates {
-            *seen = true;
-            // O manifest do petdex não traz o tamanho; HEAD lê só o Content-Length.
-            let same = net::request("HEAD", &remote.sheet_url)
-                .is_ok_and(|r| r.status == 200 && r.content_length == Some(size));
-            if same {
-                return Some(remote);
+    match catalogs.petdex() {
+        Ok(list) => {
+            let candidates: Vec<Remote> = list.iter().filter(|r| r.key == id).cloned().collect();
+            for remote in candidates {
+                found.seen = true;
+                // O manifest do petdex não traz o tamanho; HEAD lê só o Content-Length.
+                match net::request("HEAD", &remote.sheet_url) {
+                    Ok(r) if r.status == 200 && r.content_length == Some(size) => {
+                        found.remote = Some(remote);
+                        return found;
+                    }
+                    Ok(r) if r.status == 200 || r.status == 404 => {}
+                    _ => found.failed = true,
+                }
+            }
+        }
+        Err(_) => found.failed = true,
+    }
+    match catalogs.awesome() {
+        Err(_) => found.failed = true,
+        Ok(list) => {
+            let candidates: Vec<&Remote> = list
+                .iter()
+                .filter(|r| awesome_matches(id, &r.key))
+                .collect();
+            if !candidates.is_empty() {
+                found.seen = true;
+                if let Ok(blob) = net::git_blob_sha1(sheet)
+                    && let Some(remote) = candidates
+                        .into_iter()
+                        .find(|r| r.sheet_blob.as_deref() == Some(blob.as_str()))
+                {
+                    found.remote = Some(remote.clone());
+                }
             }
         }
     }
-    if let Ok(list) = catalogs.awesome() {
-        let candidates: Vec<&Remote> = list
-            .iter()
-            .filter(|r| awesome_matches(id, &r.key))
-            .collect();
-        if !candidates.is_empty() {
-            *seen = true;
-            if let Ok(blob) = net::git_blob_sha1(sheet)
-                && let Some(remote) = candidates
-                    .into_iter()
-                    .find(|r| r.sheet_blob.as_deref() == Some(blob.as_str()))
-            {
-                return Some(remote.clone());
-            }
-        }
-    }
-    None
+    found
 }
 
 fn unmatched_status(seen: bool) -> Status {
@@ -351,8 +388,13 @@ fn local_sheet(pet: &PetInfo) -> Option<PathBuf> {
 /// Checa todos os pets locais. Pets novos são identificados uma vez; os já identificados só
 /// comparam a versão. Devolve a situação de cada um, na ordem de `pets`.
 pub fn check(pets: &[PetInfo]) -> Vec<(PetInfo, Status, Option<Remote>)> {
-    let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut state = State::load();
+    // Why: o lock cobre só ler e gravar o arquivo. A rede pode levar minutos (um pedido por pet,
+    // timeouts de 30 s) e o `apply` de uma atualização não pode ficar esperando por ela.
+    let state = {
+        let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        State::load()
+    };
+    let mut changes: Vec<(String, Known)> = Vec::new();
     let mut catalogs = Catalogs::default();
     let mut out = Vec::new();
 
@@ -364,12 +406,30 @@ pub fn check(pets: &[PetInfo]) -> Vec<(PetInfo, Status, Option<Remote>)> {
         let size = std::fs::metadata(&sheet_path).map(|m| m.len()).unwrap_or(0);
 
         let result = match state.0.get(&pet.id).cloned() {
+            Some(Known::Tracked { size: known, .. }) if known != 0 && known != size => {
+                (Status::EditedLocally, None)
+            }
             Some(Known::Tracked {
                 source,
                 key,
                 version,
+                size: known,
             }) => match lookup(&mut catalogs, source, &key) {
-                Ok(Some(remote)) if remote.version == version => (Status::UpToDate(source), None),
+                Ok(Some(remote)) if remote.version == version => {
+                    // Estado antigo sem tamanho: anota agora, para detectar edições daqui em diante.
+                    if known == 0 {
+                        changes.push((
+                            pet.id.clone(),
+                            Known::Tracked {
+                                source,
+                                key,
+                                version,
+                                size,
+                            },
+                        ));
+                    }
+                    (Status::UpToDate(source), None)
+                }
                 Ok(Some(remote)) => (Status::UpdateAvailable(source), Some(remote)),
                 // Saiu do catálogo: mantém como está, sem atualização.
                 Ok(None) => (Status::UpToDate(source), None),
@@ -387,31 +447,49 @@ pub fn check(pets: &[PetInfo]) -> Vec<(PetInfo, Status, Option<Remote>)> {
                     ));
                     continue;
                 };
-                let mut seen = false;
-                match identify(&mut catalogs, &pet.id, &sheet, &mut seen) {
+                let found = identify(&mut catalogs, &pet.id, &sheet);
+                match found.remote {
                     Some(remote) => {
-                        state.0.insert(
+                        changes.push((
                             pet.id.clone(),
                             Known::Tracked {
                                 source: remote.source,
                                 key: remote.key.clone(),
                                 version: remote.version.clone(),
+                                size,
                             },
-                        );
+                        ));
                         (Status::UpToDate(remote.source), None)
                     }
+                    // Sem resposta de algum catálogo: não grava nada e tenta de novo na próxima.
+                    None if found.failed => (
+                        Status::Error(
+                            "catálogo sem resposta; tenta de novo na próxima checagem".into(),
+                        ),
+                        None,
+                    ),
                     None => {
-                        state
-                            .0
-                            .insert(pet.id.clone(), Known::Unmatched { size, seen });
-                        (unmatched_status(seen), None)
+                        changes.push((
+                            pet.id.clone(),
+                            Known::Unmatched {
+                                size,
+                                seen: found.seen,
+                            },
+                        ));
+                        (unmatched_status(found.seen), None)
                     }
                 }
             }
         };
         out.push((pet.clone(), result.0, result.1));
     }
-    state.save();
+    if !changes.is_empty() {
+        // Relê antes de gravar: um `apply` pode ter registrado versão nova enquanto a rede rodava.
+        let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut latest = State::load();
+        latest.0.extend(changes);
+        latest.save();
+    }
     out
 }
 
@@ -503,6 +581,7 @@ pub fn apply(pet_dir: &Path, update: &PetUpdate) -> Result<(), String> {
             source: remote.source,
             key: remote.key.clone(),
             version: remote.version.clone(),
+            size: sheet.len() as u64,
         },
     );
     state.save();
@@ -518,6 +597,7 @@ pub fn report(pets: &[PetInfo]) -> String {
                 Status::UpToDate(s) => format!("atualizado ({})", s.label()),
                 Status::UpdateAvailable(s) => format!("VERSÃO NOVA em {}", s.label()),
                 Status::Different => "diferente do catálogo (não atualiza)".into(),
+                Status::EditedLocally => "editado localmente (não atualiza)".into(),
                 Status::NotInCatalogs => "não está em nenhum catálogo".into(),
                 Status::Error(e) => format!("erro: {e}"),
             };
@@ -589,6 +669,14 @@ mod tests {
     }
 
     #[test]
+    fn codex_pets_version_reads_only_the_v_parameter() {
+        let pet = json!({"downloadUrl":"/api/pets/x/download?rev=3&v=1777"});
+        assert_eq!(codex_pets_version(&pet).as_deref(), Some("1777"));
+        let pet = json!({"downloadUrl":"/api/pets/x/download?dev=1", "uploadedAt":"2026"});
+        assert_eq!(codex_pets_version(&pet).as_deref(), Some("2026"));
+    }
+
+    #[test]
     fn codex_pets_version_falls_back_to_sheet_path() {
         let pet = json!({"spritesheetUrl":"https://x/assets/pets/v/42/a/spritesheet.webp"});
         assert_eq!(codex_pets_version(&pet).as_deref(), Some("42"));
@@ -630,6 +718,7 @@ mod tests {
                 source: Source::CodexPets,
                 key: "goku".into(),
                 version: "1".into(),
+                size: 10,
             },
         );
         s.0.insert(
@@ -645,7 +734,12 @@ mod tests {
         );
         let back: State = serde_json::from_str(&text).unwrap();
         assert_eq!(back.0, s.0);
-        // Estado gravado antes do campo `seen` ainda carrega.
+        // Estados gravados antes dos campos `seen` e `size` ainda carregam.
+        let tracked: State = serde_json::from_str(
+            r#"{"g":{"status":"tracked","source":"petdex","key":"g","version":"1"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(tracked.0["g"], Known::Tracked { size: 0, .. }));
         let old: State = serde_json::from_str(r#"{"x":{"status":"unmatched","size":1}}"#).unwrap();
         assert_eq!(
             old.0["x"],

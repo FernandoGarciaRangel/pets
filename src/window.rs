@@ -45,6 +45,8 @@ const WM_APP_TRAY: u32 = WM_APP + 2;
 const WM_APP_SHOW: u32 = WM_APP + 3;
 const WM_APP_QUIT: u32 = WM_APP + 4;
 const WM_APP_UPDATE: u32 = WM_APP + 5;
+/// O painel do slider fechou num momento em que o App estava emprestado: termina depois.
+const WM_APP_RESIZE_DONE: u32 = WM_APP + 6;
 const TIMER_FRAME: usize = 1;
 const TIMER_STATE: usize = 2;
 const TIMER_UPDATE: usize = 3;
@@ -74,7 +76,7 @@ const ID_SIZE_PANEL: u32 = 18;
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
 }
-static HWND_FOR_CTRL_C: AtomicIsize = AtomicIsize::new(0);
+static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// Bitmap 32 bpp selecionado num DC de memória: a origem do `UpdateLayeredWindow`.
 struct Dib {
@@ -145,7 +147,7 @@ enum Outcome {
     Message(String, bool),
     ConfirmUpdate(String),
     /// Pergunta se aplica as atualizações de pets; o texto já vem montado.
-    ConfirmPetUpdates(String),
+    ConfirmPetUpdates(String, Vec<PetUpdate>),
 }
 
 /// Resultado das threads de atualização, entregue via `WM_APP_UPDATE`.
@@ -288,12 +290,12 @@ pub fn quit_running_instance() -> bool {
 fn install_ctrl_c(hwnd: HWND) {
     use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
     unsafe extern "system" fn handler(_ctrl: u32) -> i32 {
-        let hwnd = HWND_FOR_CTRL_C.load(Ordering::SeqCst);
+        let hwnd = MAIN_HWND.load(Ordering::SeqCst);
         // SAFETY: PostMessageW é seguro a partir de qualquer thread.
         unsafe { PostMessageW(hwnd as HWND, WM_APP_QUIT, 0, 0) };
         1
     }
-    HWND_FOR_CTRL_C.store(hwnd as isize, Ordering::SeqCst);
+    MAIN_HWND.store(hwnd as isize, Ordering::SeqCst);
     // SAFETY: handler com a assinatura de PHANDLER_ROUTINE.
     unsafe { SetConsoleCtrlHandler(Some(handler), 1) };
 }
@@ -322,9 +324,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 system::message_box(&text, error);
                 0
             }
-            Some(Outcome::ConfirmPetUpdates(question)) => {
+            Some(Outcome::ConfirmPetUpdates(question, approved)) => {
                 if system::confirm(&question) {
-                    with_app(|app| app.start_pet_updates(None));
+                    with_app(|app| app.apply_pet_updates(approved));
                 }
                 0
             }
@@ -453,7 +455,11 @@ pub fn preview_width(width: u32) {
 
 /// O painel fechou: refaz em qualidade final e salva.
 pub fn commit_width() {
-    with_app(App::finish_resize);
+    if with_app(App::finish_resize).is_none() {
+        let hwnd = MAIN_HWND.load(Ordering::SeqCst);
+        // SAFETY: PostMessageW para a nossa janela principal.
+        unsafe { PostMessageW(hwnd as HWND, WM_APP_RESIZE_DONE, 0, 0) };
+    }
 }
 
 fn checked(on: bool) -> u32 {
@@ -530,17 +536,25 @@ impl App {
 
     /// Aplica numa thread as atualizações de pets: todas (`None`) ou a de índice `only`.
     fn start_pet_updates(&mut self, only: Option<usize>) {
-        if self.updating_pets {
-            return;
-        }
-        let chosen: Vec<(PetUpdate, PathBuf)> = self
+        let chosen = self
             .pet_updates
             .iter()
             .enumerate()
             .filter(|(i, _)| only.is_none_or(|o| o == *i))
-            .filter_map(|(_, u)| {
+            .map(|(_, u)| u.clone())
+            .collect();
+        self.apply_pet_updates(chosen);
+    }
+
+    fn apply_pet_updates(&mut self, updates: Vec<PetUpdate>) {
+        if self.updating_pets {
+            return;
+        }
+        let chosen: Vec<(PetUpdate, PathBuf)> = updates
+            .into_iter()
+            .filter_map(|u| {
                 let dir = self.pets.iter().find(|p| p.id == u.id)?.dir.clone();
-                Some((u.clone(), dir))
+                Some((u, dir))
             })
             .collect();
         if chosen.is_empty() {
@@ -555,6 +569,10 @@ impl App {
                 .collect();
             post_update(hwnd, UpdateMsg::PetsApplied(results));
         });
+    }
+
+    fn confirm_pet_updates(&self) -> Outcome {
+        Outcome::ConfirmPetUpdates(self.pet_updates_question(), self.pet_updates.clone())
     }
 
     fn pet_updates_question(&self) -> String {
@@ -627,7 +645,7 @@ impl App {
                     return Outcome::Handled(0);
                 }
                 if manual {
-                    return Outcome::ConfirmPetUpdates(self.pet_updates_question());
+                    return self.confirm_pet_updates();
                 }
                 // Avisa só quando aparece pet novo na lista.
                 let ids: Vec<String> = self.pet_updates.iter().map(|u| u.id.clone()).collect();
@@ -1096,12 +1114,13 @@ impl App {
                         return Outcome::ConfirmUpdate(release.version.clone());
                     }
                     if !self.pet_updates.is_empty() && !self.updating_pets {
-                        return Outcome::ConfirmPetUpdates(self.pet_updates_question());
+                        return self.confirm_pet_updates();
                     }
                 }
                 _ => {}
             },
             WM_APP_SHOW => self.set_visible(true),
+            WM_APP_RESIZE_DONE => self.finish_resize(),
             WM_APP_QUIT => {
                 self.cfg.save();
                 self.tray.remove();

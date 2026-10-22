@@ -9,7 +9,7 @@ Pets do Codex flutuando em qualquer tela do Windows, reagindo ao que o **Claude 
 - Usa os pets que já estão em `~/.codex/pets/<pet>/` (`pet.json` + `spritesheet.webp`, o formato do Codex).
 - Controle pelo ícone na bandeja ou com o clique direito no pet: trocar pet, esconder, iniciar com o Windows.
 - Tamanho livre: menu **Tamanho…** abre um slider (48–512 px) que redimensiona ao vivo.
-- Vem com uma biblioteca de pets originais do projeto, **Tatu-canastra** (o padrão) e **Fluxo**, instalados em
+- Vem com uma biblioteca de pets originais do projeto, **Tatu-canastra** (o padrão) e **Draco**, instalados em
   `~/.codex/pets` na primeira execução e listados à parte no menu (**Do Pets** / **Seus pets**).
 
 ## Animações

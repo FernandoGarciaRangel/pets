@@ -80,12 +80,16 @@ pub fn open(pet: HWND, width: u32) {
         info.cbSize = size_of::<MONITORINFO>() as u32;
         GetMonitorInfoW(MonitorFromWindow(pet, MONITOR_DEFAULTTONEAREST), &mut info);
         let work = info.rcWork;
-        let x = ((pet_rect.left + pet_rect.right) / 2 - w / 2).clamp(work.left, work.right - w);
+        // Why: min/max em vez de clamp, que dá panic (e aborta o app) quando o painel é mais
+        // largo ou alto que a área útil; aí ele fica encostado na borda esquerda/de cima.
+        let x = ((pet_rect.left + pet_rect.right) / 2 - w / 2)
+            .min(work.right - w)
+            .max(work.left);
         let above = pet_rect.top - h - px(8);
         let y = if above >= work.top {
             above
         } else {
-            (pet_rect.bottom + px(8)).min(work.bottom - h)
+            (pet_rect.bottom + px(8)).min(work.bottom - h).max(work.top)
         };
 
         let title = wide("Tamanho do pet");

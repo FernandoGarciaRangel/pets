@@ -16,21 +16,23 @@ macro_rules! builtin {
     ($id:literal) => {
         Builtin {
             id: $id,
+            // O pet.json vai por último: é ele que marca o pet como instalado, então uma
+            // escrita interrompida no spritesheet não deixa um pet quebrado "instalado".
             files: &[
-                (
-                    "pet.json",
-                    include_bytes!(concat!("../assets/pets/", $id, "/pet.json")),
-                ),
                 (
                     "spritesheet.webp",
                     include_bytes!(concat!("../assets/pets/", $id, "/spritesheet.webp")),
+                ),
+                (
+                    "pet.json",
+                    include_bytes!(concat!("../assets/pets/", $id, "/pet.json")),
                 ),
             ],
         }
     };
 }
 
-pub const BUILTIN: &[Builtin] = &[builtin!("tatu-canastra"), builtin!("fluxo")];
+pub const BUILTIN: &[Builtin] = &[builtin!("tatu-canastra"), builtin!("draco")];
 
 /// Instala os embutidos que ainda não foram instalados. `done` são os ids já instalados antes
 /// (vêm do config); devolve os que entraram agora.
