@@ -7,7 +7,7 @@ Pets is a Windows-only Rust desktop app. It shows a Codex pet (`~/.codex/pets/<p
 ## Commands
 
 ```powershell
-./dev.ps1                 # cargo run (debug, console); hook events are printed as "[hook] ..."
+./dev.ps1                 # cargo run (debug, console); prints "[hook] ..." and "[pets] ..." (folder reloads)
 ./dev.ps1 -Release        # optimized build
 ./dev.ps1 -Install        # cargo build --release + `pets.exe install`
 ./dev.ps1 -- install-hooks  # passes args through to pets.exe
@@ -29,18 +29,26 @@ A single exe plays two roles:
    - **Animation:** a `SetTimer` fires only when the frame changes, using that frame's own duration.
    - **Single instance:** a named mutex. A second launch posts `WM_APP_SHOW` to the instance already running.
    - **Tray** (`tray.rs`): the tray icon is always the app logo (`tray::app_icon`, resource 1); the pet is already visible on screen.
-2. **Hook client** (`hook.rs`): the agents invoke `pets.exe hook claude|codex`. It reads the payload from stdin and writes one JSON line (`agents::HookEvent`) to the named pipe `\\.\pipe\pets-agent-state`, then exits. If the app is not running it exits silently. It must never block the agent or print to stdout.
+2. **Hook client** (`hook.rs`): the agents invoke `pets.exe hook claude|codex`. It reads the payload from stdin and writes one JSON line (`agents::HookEvent`) to the named pipe `\\.\pipe\pets-agent-state`, then exits. If the app is not running it exits silently. It must never block the agent or print to stdout. When the pipe is busy it waits up to ~2 s (`WaitNamedPipeW`, 10 × 200 ms).
 
 Data flow:
 - A thread in `agents::spawn_pipe_server` receives each event and hands a `Box<HookEvent>` to the window via `PostMessageW(WM_APP_HOOK)`.
+- The pipe server creates the **next** instance before reading the current one, so the pipe name never disappears between events (a client that found no pipe would assume the app was closed and drop the event). Instances are overlapped: each client gets at most 250 ms (`READ_DEADLINE`) to send its line, so a client that connects and never closes cannot stall the others. Test with ~20 concurrent `target/debug/pets.exe hook claude` processes, with and without a client holding the pipe open.
 - `Sessions`, keyed by (agent, session_id), maps hook events to `AgentState`. Each state expires on its own: review lasts 60 s, failed 5 s, and sessions go stale after 10 or 30 min.
 - `aggregate` picks the most urgent state across sessions: waiting > working > failed > done > idle.
 - `animation::select` applies interaction on top of that state: dragging → running-left/right, hover → jumping.
+- Click animations (`window::play_click`): a click without dragging plays the pet's next `click` animation **once** (`click_anim`, which `refresh_anim` prefers over everything but a real drag), then `next_frame` drops it and the state/hover animation returns. A real drag interrupts it.
+
+Pets folder watcher:
+- `pets::spawn_watch` blocks on `ReadDirectoryChangesW` (no polling) and posts the changed top-level pet folders as `WM_APP_PETS_CHANGED` (`Box<Vec<String>>`; empty = buffer overflowed, treat everything as changed). After a failure it waits 5 s before reopening, so a folder without change notifications (network, WSL) does not spin the CPU.
+- The window debounces with `TIMER_PETS` (500 ms of silence, re-armed on purpose) and `reload_changed_pets` rediscovers the list; the on-screen pet is rebuilt only if its own folder changed or vanished. A load error shows a tray notification. There is no manual "Recarregar pets" item, and catalog updates also rely on the watcher.
+- `discover` orders pets by folder creation date (inclusion date); updating a pet swaps files, not the folder, so it keeps its place. Menu ids are positions in `menu_pets`, a snapshot taken in `build_menu`, because the list can change while the menu is open.
 
 Pet format (`pets.rs`):
 - It is a port of the Orca rules (`codex-pet-sprite-defaults.ts`, `pet-bundle*.ts` in github.com/stablyai/orca).
 - With no `frame` or `animations` in the manifest and a Codex grid sheet (1536 px wide, 208 px rows, 9 or more rows), the Codex layout and timing table applies: 192×208 frames, 9 named animations.
 - Otherwise it uses the explicit layout, validated the same way Orca does, or falls back to a single static frame.
+- `animations` has two meanings, told apart by `sourceRow` (`pets::Animations`): Orca's explicit layout (`row` + `frames`, requires `frame`), or Codex **extras** on top of the Codex grid (`sourceRow` names a Codex row, `frameCount`, `timingMs`), referenced by `interactions.click.animations` (mode `cycle`). Extras reuse a state's row with more frames than the state shows (e.g. 8 instead of 6). An invalid extra (unknown row, 0 frames, more frames than columns, unparsable) is dropped alone and never breaks the pet; `Layout::click` keeps only names that exist.
 - `sprite.rs` decodes the sheet once, crops and scales only the frames actually used, then drops the sheet.
 - Size is set with a slider: the menu item "Tamanho…" opens `size_panel.rs`, a separate popup window with a comctl32 trackbar that closes when it loses focus or on Esc (handled in the message loop, since focus stays on the trackbar).
 - While you drag, `window::preview_width` → `queue_resize` coalesces the trackbar events (`TIMER_RESIZE_PREVIEW`, at most one every 16 ms, without re-arming a pending timer). `resize_to` then scales **only the visible animation** (`Cells::scale_only`, fast filter) from `sprite::Cells`, the cropped frames at their original resolution, kept in memory while the panel is open.
@@ -49,10 +57,12 @@ Pet format (`pets.rs`):
 - The panel is created outside the App borrow (`After::OpenSizePanel`).
 
 Installation (`install.rs`):
-- `merge` is pure and tested. It adds this app's hook groups to `~/.claude/settings.json` and `~/.codex/hooks.json` without touching other apps' hooks (Orca, Codenotch). It recognizes its own groups by a command containing `pets.exe` + ` hook `.
-- It writes a `.bak-pets` backup first. `serde_json` uses `preserve_order` so the user's key order survives.
+- `merge` is pure and tested. It adds this app's hook groups to `settings.json` in the Claude config dir and `hooks.json` in the Codex one (`config::claude_home` / `codex_home`: `CLAUDE_CONFIG_DIR` / `CODEX_HOME`, else `~/.claude` / `~/.codex`; the pets dir follows `codex_home` too) without touching other apps' hooks (Orca, Codenotch).
+- `is_our_hook` recognizes only the exact `hook_command` shape, `<any dir>/pets.exe hook <agent>` (quoted or not); `codex-pets.exe hook` is not ours. Removal takes only our hook out of a group, so a group shared with another app's hook survives.
+- The `.bak-pets` backup is written once, before the first change, and never overwritten, so it keeps the pre-pets file. Uninstall does not rewrite a file that has no pets hooks. `serde_json` uses `preserve_order` so the user's key order survives.
 - The hooks always point at the installed copy when it exists (`hook_exe`), even if the app is running from a dev build. The menu shows `install::status()` (Claude/Codex ✓/✗) and only offers "Reinstalar hooks" when something is missing or points at another exe.
 - `install` copies the exe to `%LOCALAPPDATA%\Programs\Pets\pets.exe` (renaming the old exe aside first, which works even while it is running), reinstalls the hooks pointing at that copy, creates the shortcuts and starts the app detached.
+- `install_app(from_update)`: on an update it only redoes the hooks of agents that already had pets hooks (`contains_ours`), so it never undoes an `uninstall-hooks`. Once the old instance is quit, every failure still leaves a pet running: a failed exe swap restarts the old exe, and a failed hook merge is reported only after the new app was started.
 - Shortcuts (`system::create_shortcut`): `Pets.lnk` is created through WScript.Shell from a PowerShell without a window, because windows-sys has no IShellLink COM interfaces. The folders come from `[Environment]::GetFolderPath`, because the Desktop can be redirected to OneDrive. The Start Menu shortcut is created on every install or update; the desktop one only once (`config.desktop_shortcut_created`), so an update never recreates a shortcut the user deleted. A failure here does not abort the install.
 
 Updates (`update.rs`):
@@ -61,13 +71,15 @@ Updates (`update.rs`):
 - Updating downloads the `pets.exe` asset, verifies it against `SHA256SUMS.txt` (using BCrypt), saves it to `%TEMP%\pets-update`, and runs `<downloaded> install --from-update` detached. That reuses `install_app`: it quits the current instance, swaps the exe, reinstalls the hooks and starts the app again.
 - `pets.exe update` / `check-update` run the same path from the CLI, which is the way to test without the GUI. To simulate an old version, build with a lower `version` in `Cargo.toml` and a separate `CARGO_TARGET_DIR`.
 - The release asset names (`pets.exe`, `SHA256SUMS.txt`) are a contract between `release.yml` and `update.rs`.
+- `net::request`: WinHTTP timeouts are per operation, so a whole download also has a 5 min deadline (`DOWNLOAD_DEADLINE`), and a body shorter or longer than `Content-Length` is rejected. Max 32 MB.
+- The SHA256 check catches corruption, not a compromised release (the sums come from the same release). Signing the update was discussed and deliberately not done for now.
 
 Pet updates (`catalog.rs`):
 - The sources are codex-pets.net (`/api/pets/<id>/share-data`, one request per pet), petdex.dev (the public manifest `assets.petdex.dev/manifests/petdex-v1.json`) and awesome-codex-pet, the GitHub repo behind aimcp.info (fetched through the git tree API; folders are `<id>--<author>`).
 - A local pet only gets updates once it is **identified exactly**, meaning its spritesheet matches a catalog entry: same size on codex-pets (`spritesheetBytes`), the same `Content-Length` via HEAD on petdex, or the same git blob SHA-1 on GitHub.
 - What is known about each pet lives in `%APPDATA%\pets\pet-sources.json`: `tracked` with source, key and version, or `unmatched` with size and whether the name exists in some catalog.
 - The version marker is the `v` in the URL on codex-pets, the spritesheet URL (which carries a hash) on petdex, and the blob SHA on GitHub.
-- `apply` downloads the new version, validates it with `Cells::load` in `%APPDATA%\pets\staging`, backs up the old files to `backups/<id>-<ts>`, then swaps the files while keeping the local `id`.
+- `apply` downloads the new version, validates it with `Cells::load` in `%APPDATA%\pets\staging` (removed again if validation fails), backs up the old files to `backups/<id>-<ts>` (only the newest `KEEP_BACKUPS` = 3 per pet are kept), then swaps the files while keeping the local `id`. An update replaces `pet.json`, so local edits to it (renamed `displayName`, added click animations) are lost.
 - The check runs in the same thread as the app check (`spawn_check`) and returns as `UpdateMsg::PetsChecked`.
 - From the CLI: `check-pets` / `update-pets`. The network test is `cargo test awesome_codex_pet_end_to_end -- --ignored`.
 
@@ -75,7 +87,7 @@ Config lives in `%APPDATA%\pets\config.toml` (`config.rs`).
 
 ## Gotchas
 
-- **Reentrancy:** the `App` sits in a `thread_local RefCell` and the wndproc uses `try_borrow_mut`. Win32 calls such as `SetWindowPos`, `ReleaseCapture`, `TrackPopupMenu` and `MessageBox` re-enter the wndproc. While the App is borrowed, the message goes to `DefWindowProcW`. Modal calls (menu, MessageBox) must happen outside the borrow; see `show_menu` and the `After` enum.
+- **Reentrancy:** the `App` sits in a `thread_local RefCell` and the wndproc uses `try_borrow_mut`. Win32 calls such as `SetWindowPos`, `ReleaseCapture`, `TrackPopupMenu` and `MessageBox` re-enter the wndproc. While the App is borrowed, the message goes to `DefWindowProcW`, except `WM_APP_HOOK` and `WM_APP_PETS_CHANGED`, which are re-posted to the queue so no event is lost (and freed only if the post fails). Modal calls (menu, MessageBox) must happen outside the borrow; see `show_menu` and the `After` enum. `TrackPopupMenu`'s modal loop still dispatches timers, so App state can change while the menu is open.
 - **Release builds are GUI subsystem** (`windows_subsystem = "windows"`):
   - In PowerShell 5.1, `'...' | pets.exe hook codex` does not wait for the process and does not deliver stdin. To test a hook by hand, use `Start-Process -RedirectStandardInput file -Wait -NoNewWindow`.
   - `Start-Process -Wait` also waits for child processes, so it hangs on `install`; that is why `dev.ps1` uses `System.Diagnostics.Process`.
@@ -87,4 +99,6 @@ Config lives in `%APPDATA%\pets\config.toml` (`config.rs`).
 
 ## CI/CD
 
-`.github/workflows/ci.yml` runs fmt, clippy (`-D warnings`) and tests on `windows-latest` for every push to `main` and every PR. `release.yml` triggers on a `v*` tag, which must match the `Cargo.toml` version. It publishes `pets.exe`, a zip and `SHA256SUMS.txt` to a GitHub Release. To publish: bump the version in `Cargo.toml`, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+`.github/workflows/ci.yml` runs fmt, clippy (`-D warnings`), tests and a `cargo build --release` on `windows-latest` for every push to `main` and every PR. `release.yml` triggers on a `v*` tag, which must match the `Cargo.toml` version; it runs fmt, clippy and `cargo test --release` again before publishing, because a tag can point at a commit CI never saw. It publishes `pets.exe`, a zip and `SHA256SUMS.txt` to a GitHub Release. To publish: bump the version in `Cargo.toml` (commit "Versão X.Y.Z"), then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+Third-party actions are pinned by commit SHA with the tag in a comment (`release.yml` has `contents: write`). A SHA-pinned `dtolnay/rust-toolchain` needs `toolchain: stable` as input, since it can no longer infer it from the ref name. To bump an action, resolve the new SHA with `git ls-remote https://github.com/<owner>/<repo> <ref>`.
