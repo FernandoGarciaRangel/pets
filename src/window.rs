@@ -9,10 +9,12 @@ use crate::pets::{self, PetInfo};
 use crate::sprite::Sprite;
 use crate::system::{self, wide};
 use crate::tray::Tray;
+use crate::update::{self, CheckResult, Release};
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicIsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM,
 };
@@ -30,6 +32,7 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
+use windows_sys::Win32::UI::Shell::NIN_BALLOONUSERCLICK;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const CLASS: &str = "PetsDesktopOverlay";
@@ -37,10 +40,12 @@ const WM_APP_HOOK: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
 const WM_APP_SHOW: u32 = WM_APP + 3;
 const WM_APP_QUIT: u32 = WM_APP + 4;
+const WM_APP_UPDATE: u32 = WM_APP + 5;
 // Fica em Win32_UI_Controls no windows-sys; não vale a feature inteira por uma constante.
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const TIMER_FRAME: usize = 1;
 const TIMER_STATE: usize = 2;
+const TIMER_UPDATE: usize = 3;
 /// Deslocamento mínimo (px) para um clique virar arrasto.
 const DRAG_SLOP: i32 = 3;
 
@@ -49,6 +54,9 @@ const ID_AUTOSTART: u32 = 11;
 const ID_RELOAD: u32 = 12;
 const ID_INSTALL: u32 = 13;
 const ID_OPEN_DIR: u32 = 14;
+const ID_UPDATE: u32 = 15;
+const ID_CHECK_UPDATE: u32 = 16;
+const ID_AUTO_UPDATE: u32 = 17;
 const ID_QUIT: u32 = 99;
 const ID_PET_BASE: u32 = 1000;
 const ID_SIZE_BASE: u32 = 2000;
@@ -123,6 +131,15 @@ enum Outcome {
     Handled(LRESULT),
     Default,
     Menu,
+    /// Caixa de mensagem: modal, então só depois de soltar o App.
+    Message(String, bool),
+    ConfirmUpdate(String),
+}
+
+/// Resultado das threads de atualização, entregue via `WM_APP_UPDATE`.
+enum UpdateMsg {
+    Checked { result: CheckResult, manual: bool },
+    Downloaded(Result<PathBuf, String>),
 }
 
 enum After {
@@ -147,6 +164,9 @@ struct App {
     pos: POINT,
     hovering: bool,
     drag: Option<DragState>,
+    update: Option<Release>,
+    notified_version: Option<String>,
+    updating: bool,
 }
 
 pub fn run() {
@@ -265,9 +285,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 show_menu(hwnd);
                 0
             }
+            Some(Outcome::Message(text, error)) => {
+                system::message_box(&text, error);
+                0
+            }
+            Some(Outcome::ConfirmUpdate(version)) => {
+                let question = format!(
+                    "Pets v{version} está disponível (você tem v{}).\n\nAtualizar agora?",
+                    update::current_version()
+                );
+                if system::confirm(&question) {
+                    with_app(App::start_download);
+                }
+                0
+            }
             None if msg == WM_APP_HOOK => {
                 // Não deu para entregar ao App (reentrada): só libera o evento.
                 drop(Box::from_raw(lp as *mut HookEvent));
+                0
+            }
+            None if msg == WM_APP_UPDATE => {
+                drop(Box::from_raw(lp as *mut UpdateMsg));
                 0
             }
             _ => DefWindowProcW(hwnd, msg, wp, lp),
@@ -347,6 +385,24 @@ fn append_submenu(menu: HMENU, submenu: HMENU, text: &str) {
     unsafe { AppendMenuW(menu, MF_POPUP, submenu as usize, text.as_ptr()) };
 }
 
+fn post_update(hwnd: isize, msg: UpdateMsg) {
+    let ptr = Box::into_raw(Box::new(msg));
+    // SAFETY: a janela retoma a posse do Box em WM_APP_UPDATE; se o post falhar, liberamos aqui.
+    if unsafe { PostMessageW(hwnd as HWND, WM_APP_UPDATE, 0, ptr as isize) } == 0 {
+        drop(unsafe { Box::from_raw(ptr) });
+    }
+}
+
+/// Checa o GitHub numa thread (rede bloqueante não pode rodar na thread da janela).
+fn spawn_check(hwnd: HWND, manual: bool, delay: Duration) {
+    let hwnd = hwnd as isize;
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        let result = update::check();
+        post_update(hwnd, UpdateMsg::Checked { result, manual });
+    });
+}
+
 fn checked(on: bool) -> u32 {
     if on { MF_CHECKED } else { MF_UNCHECKED }
 }
@@ -375,6 +431,9 @@ impl App {
             },
             hovering: false,
             drag: None,
+            update: None,
+            notified_version: None,
+            updating: false,
             cfg,
         }
     }
@@ -388,6 +447,95 @@ impl App {
         }
         self.move_to(self.pos);
         self.apply_visibility();
+
+        // Sobra de uma atualização anterior.
+        let _ = std::fs::remove_dir_all(update::staging_dir());
+        if self.cfg.check_updates {
+            spawn_check(self.hwnd, false, Duration::from_secs(10));
+        }
+        // SAFETY: timer da nossa janela.
+        unsafe {
+            SetTimer(
+                self.hwnd,
+                TIMER_UPDATE,
+                update::CHECK_EVERY.as_millis() as u32,
+                None,
+            )
+        };
+    }
+
+    fn start_download(&mut self) {
+        let Some(release) = self.update.clone() else {
+            return;
+        };
+        if self.updating {
+            return;
+        }
+        self.updating = true;
+        self.refresh_tip();
+        let hwnd = self.hwnd as isize;
+        std::thread::spawn(move || {
+            post_update(hwnd, UpdateMsg::Downloaded(update::download(&release)));
+        });
+    }
+
+    fn on_update(&mut self, msg: UpdateMsg) -> Outcome {
+        match msg {
+            UpdateMsg::Checked { result, manual } => match result {
+                CheckResult::Available(release) => {
+                    let version = release.version.clone();
+                    self.update = Some(release);
+                    self.refresh_tip();
+                    if manual {
+                        return Outcome::ConfirmUpdate(version);
+                    }
+                    // Avisa uma vez por versão; o item do menu continua lá.
+                    if self.notified_version.as_deref() != Some(version.as_str()) {
+                        self.tray.notify(
+                            &format!("Pets v{version} disponível"),
+                            "Clique aqui ou use o menu do pet para atualizar.",
+                        );
+                        self.notified_version = Some(version);
+                    }
+                }
+                CheckResult::UpToDate if manual => {
+                    return Outcome::Message(
+                        format!(
+                            "Você já está na versão mais recente (v{}).",
+                            update::current_version()
+                        ),
+                        false,
+                    );
+                }
+                CheckResult::Failed(e) if manual => {
+                    return Outcome::Message(
+                        format!("Não consegui procurar atualizações: {e}"),
+                        true,
+                    );
+                }
+                CheckResult::Failed(e) => eprintln!("[update] {e}"),
+                CheckResult::UpToDate => {}
+            },
+            UpdateMsg::Downloaded(Ok(path)) => {
+                // O exe baixado roda `install`: fecha este pet, troca o exe instalado e sobe de novo.
+                if let Err(e) = install::spawn_detached(&path, &["install", "--from-update"]) {
+                    self.updating = false;
+                    self.refresh_tip();
+                    return Outcome::Message(e, true);
+                }
+            }
+            UpdateMsg::Downloaded(Err(e)) => {
+                self.updating = false;
+                self.refresh_tip();
+                return Outcome::Message(format!("Não consegui baixar a atualização: {e}"), true);
+            }
+        }
+        Outcome::Handled(0)
+    }
+
+    fn refresh_tip(&mut self) {
+        let tip = self.tip();
+        self.tray.update(None, &tip);
     }
 
     fn size(&self) -> Option<(i32, i32)> {
@@ -470,7 +618,15 @@ impl App {
     fn tip(&self) -> String {
         match &self.error {
             Some(e) => format!("Pets — {e}"),
-            None => format!("{} — {}", self.current_label(), self.state.label()),
+            None => {
+                let mut tip = format!("{} — {}", self.current_label(), self.state.label());
+                if self.updating {
+                    tip.push_str(" · atualizando…");
+                } else if let Some(release) = &self.update {
+                    tip.push_str(&format!(" · v{} disponível", release.version));
+                }
+                tip
+            }
         }
     }
 
@@ -675,6 +831,10 @@ impl App {
             WM_TIMER => match wp {
                 TIMER_FRAME => self.next_frame(),
                 TIMER_STATE => self.refresh_state(),
+                TIMER_UPDATE if self.cfg.check_updates => {
+                    spawn_check(self.hwnd, false, Duration::ZERO)
+                }
+                TIMER_UPDATE => {}
                 _ => return Outcome::Default,
             },
             WM_APP_HOOK => {
@@ -683,9 +843,21 @@ impl App {
                 self.sessions.apply(&ev, Instant::now());
                 self.refresh_state();
             }
+            WM_APP_UPDATE => {
+                // SAFETY: post_update criou este Box e passou a posse pela mensagem.
+                let msg = unsafe { Box::from_raw(lp as *mut UpdateMsg) };
+                return self.on_update(*msg);
+            }
             WM_APP_TRAY => match (lp as u32) & 0xffff {
                 WM_LBUTTONUP => self.set_visible(!self.cfg.visible),
                 WM_RBUTTONUP | WM_CONTEXTMENU => return Outcome::Menu,
+                NIN_BALLOONUSERCLICK => {
+                    if let Some(release) = &self.update
+                        && !self.updating
+                    {
+                        return Outcome::ConfirmUpdate(release.version.clone());
+                    }
+                }
                 _ => {}
             },
             WM_APP_SHOW => self.set_visible(true),
@@ -755,6 +927,16 @@ impl App {
                 ));
             }
             append(menu, MF_STRING | MF_GRAYED, 0, &header);
+            if self.updating {
+                append(menu, MF_STRING | MF_GRAYED, 0, "Baixando atualização…");
+            } else if let Some(release) = &self.update {
+                append(
+                    menu,
+                    MF_STRING,
+                    ID_UPDATE,
+                    &format!("Atualizar para v{}", release.version),
+                );
+            }
             append(menu, MF_SEPARATOR, 0, "");
 
             let pets_menu = CreatePopupMenu();
@@ -809,6 +991,19 @@ impl App {
                 "Instalar hooks (Claude Code + Codex)",
             );
             append(menu, MF_SEPARATOR, 0, "");
+            append(
+                menu,
+                MF_STRING,
+                ID_CHECK_UPDATE,
+                &format!("Procurar atualizações (v{})", update::current_version()),
+            );
+            append(
+                menu,
+                MF_STRING | checked(self.cfg.check_updates),
+                ID_AUTO_UPDATE,
+                "Procurar atualizações automaticamente",
+            );
+            append(menu, MF_SEPARATOR, 0, "");
             append(menu, MF_STRING, ID_QUIT, "Sair");
             menu
         }
@@ -828,6 +1023,12 @@ impl App {
                     Ok(text) => After::Message(text, false),
                     Err(text) => After::Message(text, true),
                 };
+            }
+            ID_UPDATE => self.start_download(),
+            ID_CHECK_UPDATE => spawn_check(self.hwnd, true, Duration::ZERO),
+            ID_AUTO_UPDATE => {
+                self.cfg.check_updates = !self.cfg.check_updates;
+                self.cfg.save();
             }
             ID_QUIT => {
                 self.cfg.save();

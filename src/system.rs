@@ -114,6 +114,23 @@ pub fn message_box(text: &str, error: bool) {
     };
 }
 
+/// Pergunta Sim/Não; devolve true no Sim.
+pub fn confirm(text: &str) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IDYES, MB_ICONQUESTION, MB_YESNO, MessageBoxW,
+    };
+    let (text, title) = (wide(text), wide("Pets"));
+    // SAFETY: strings terminadas em NUL; modal sem dono.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_YESNO | MB_ICONQUESTION,
+        ) == IDYES
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

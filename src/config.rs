@@ -14,6 +14,8 @@ pub struct Config {
     pub y: Option<i32>,
     pub visible: bool,
     pub pets_dir: Option<PathBuf>,
+    /// Procura versão nova no GitHub ao iniciar e a cada 6 h.
+    pub check_updates: bool,
 }
 
 impl Default for Config {
@@ -25,6 +27,7 @@ impl Default for Config {
             y: None,
             visible: true,
             pets_dir: None,
+            check_updates: true,
         }
     }
 }

@@ -35,6 +35,17 @@ O Codex pode pedir para confiar nos hooks novos na próxima sessão.
 
 Para tirar os hooks: `pets.exe uninstall-hooks`.
 
+## Atualizações
+
+O app procura versão nova no GitHub ao iniciar e a cada 6 h. Quando encontra, mostra uma notificação e um item
+**Atualizar para vX** no menu; ao clicar, baixa o `pets.exe` da release, confere o SHA-256 com o `SHA256SUMS.txt`
+e se reinstala sozinho. Dá para desligar a checagem automática no menu ou forçar pela linha de comando:
+
+```powershell
+pets.exe check-update   # só consulta
+pets.exe update         # consulta, baixa e instala
+```
+
 ## Pets
 
 Qualquer pasta em `~/.codex/pets` com um `pet.json` vira um pet. Sem layout no manifest, vale o grid do Codex:

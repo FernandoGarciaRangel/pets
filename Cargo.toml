@@ -1,10 +1,10 @@
 [package]
 name = "pets"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Pets do Codex flutuando em qualquer tela do Windows, reagindo ao Claude Code e ao Codex."
 license = "MIT"
-repository = "https://github.com/FernandoGarciaSimpipe/pets"
+repository = "https://github.com/FernandoGarciaRangel/pets"
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["webp", "png"] }
@@ -17,7 +17,9 @@ version = "0.61"
 features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Networking_WinHttp",
     "Win32_Security",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_IO",

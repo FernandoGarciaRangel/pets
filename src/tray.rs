@@ -8,8 +8,8 @@ use windows_sys::Win32::Graphics::Gdi::{
     DeleteObject,
 };
 use windows_sys::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-    Shell_NotifyIconW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateIconIndirect, DestroyIcon, HICON, ICONINFO, IDI_APPLICATION, LoadIconW,
@@ -76,6 +76,25 @@ impl Tray {
         }
         self.tip = tip.to_string();
         let nid = self.data();
+        // SAFETY: nid válido durante a chamada.
+        unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
+    }
+
+    /// Notificação (balão/toast). Clicar nela chega como `NIN_BALLOONUSERCLICK` na mensagem da bandeja.
+    pub fn notify(&self, title: &str, text: &str) {
+        let mut nid = self.data();
+        nid.uFlags |= NIF_INFO;
+        nid.dwInfoFlags = NIIF_INFO;
+        for (dst, src) in nid
+            .szInfoTitle
+            .iter_mut()
+            .zip(title.encode_utf16().take(63))
+        {
+            *dst = src;
+        }
+        for (dst, src) in nid.szInfo.iter_mut().zip(text.encode_utf16().take(255)) {
+            *dst = src;
+        }
         // SAFETY: nid válido durante a chamada.
         unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
     }

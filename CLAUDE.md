@@ -18,7 +18,7 @@ cargo fmt --check; cargo clippy --all-targets -- -D warnings   # CI requires bot
 
 Always start services in the current terminal with `dev.ps1`. Never open an external window, because the logs would be lost.
 
-CLI modes (`src/main.rs`): with no arguments the app runs; `hook <claude|codex>`, `install`, `install-hooks` and `uninstall-hooks` are the other modes.
+CLI modes (`src/main.rs`): with no arguments the app runs; `hook <claude|codex>`, `install`, `update`, `check-update`, `install-hooks` and `uninstall-hooks` are the other modes.
 
 ## Architecture
 
@@ -47,6 +47,13 @@ Installation (`install.rs`):
 - `merge` is pure and tested. It adds this app's hook groups to `~/.claude/settings.json` and `~/.codex/hooks.json` without touching other apps' hooks (Orca, Codenotch). It recognizes its own groups by a command containing `pets.exe` + ` hook `.
 - It writes a `.bak-pets` backup first. `serde_json` uses `preserve_order` so the user's key order survives.
 - `install` copies the exe to `%LOCALAPPDATA%\Programs\Pets\pets.exe` (renaming the old exe aside first, which works even while it is running), reinstalls the hooks pointing at that copy, and starts the app detached.
+
+Updates (`update.rs`):
+- The app checks `api.github.com/repos/FernandoGarciaRangel/pets/releases/latest` on startup (after 10 s) and every 6 h, using WinHTTP from a separate thread.
+- The result returns to the window as `UpdateMsg` via `WM_APP_UPDATE`, which drives the notification and the menu item.
+- Updating downloads the `pets.exe` asset, verifies it against `SHA256SUMS.txt` (using BCrypt), saves it to `%TEMP%\pets-update`, and runs `<downloaded> install --from-update` detached. That reuses `install_app`: it quits the current instance, swaps the exe, reinstalls the hooks and starts the app again.
+- `pets.exe update` / `check-update` run the same path from the CLI, which is the way to test without the GUI. To simulate an old version, build with a lower `version` in `Cargo.toml` and a separate `CARGO_TARGET_DIR`.
+- The release asset names (`pets.exe`, `SHA256SUMS.txt`) are a contract between `release.yml` and `update.rs`.
 
 Config lives in `%APPDATA%\pets\config.toml` (`config.rs`).
 

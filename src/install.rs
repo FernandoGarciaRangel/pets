@@ -99,7 +99,7 @@ pub fn install_app() -> Result<String, String> {
         crate::system::set_autostart_exe(Some(&dest));
         lines.push("iniciar com o Windows agora aponta para a cópia instalada".into());
     }
-    spawn_detached(&dest)?;
+    spawn_detached(&dest, &[])?;
     lines.push(if was_running {
         "pet reiniciado".into()
     } else {
@@ -110,7 +110,7 @@ pub fn install_app() -> Result<String, String> {
 
 /// Why: se o pet herdar o stdout redirecionado de quem chamou o install, o chamador fica
 /// esperando o pipe fechar, e o pet nunca fecha. Tira a herança dos std handles antes do spawn.
-fn spawn_detached(exe: &Path) -> Result<(), String> {
+pub fn spawn_detached(exe: &Path, args: &[&str]) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
     use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
@@ -124,6 +124,7 @@ fn spawn_detached(exe: &Path) -> Result<(), String> {
         unsafe { SetHandleInformation(GetStdHandle(id), HANDLE_FLAG_INHERIT, 0) };
     }
     Command::new(exe)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
