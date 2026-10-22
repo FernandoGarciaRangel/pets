@@ -47,6 +47,7 @@ Pet format (`pets.rs`):
 Installation (`install.rs`):
 - `merge` is pure and tested. It adds this app's hook groups to `~/.claude/settings.json` and `~/.codex/hooks.json` without touching other apps' hooks (Orca, Codenotch). It recognizes its own groups by a command containing `pets.exe` + ` hook `.
 - It writes a `.bak-pets` backup first. `serde_json` uses `preserve_order` so the user's key order survives.
+- The hooks always point at the installed copy when it exists (`hook_exe`), even if the app is running from a dev build. The menu shows `install::status()` (Claude/Codex ✓/✗) and only offers "Reinstalar hooks" when something is missing or points at another exe.
 - `install` copies the exe to `%LOCALAPPDATA%\Programs\Pets\pets.exe` (renaming the old exe aside first, which works even while it is running), reinstalls the hooks pointing at that copy, and starts the app detached.
 
 Updates (`update.rs`):

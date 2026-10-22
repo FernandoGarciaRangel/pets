@@ -55,7 +55,17 @@ fn targets() -> Vec<Target> {
 }
 
 pub fn install() -> Result<String, String> {
-    install_hooks_for(&std::env::current_exe().map_err(|e| e.to_string())?)
+    install_hooks_for(&hook_exe()?)
+}
+
+/// Para onde os hooks apontam: a cópia instalada, se existir; senão este exe.
+/// Why: reinstalar os hooks rodando um build de dev desviava os agentes para `target/`.
+fn hook_exe() -> Result<PathBuf, String> {
+    let installed = installed_exe();
+    if installed.is_file() {
+        return Ok(installed);
+    }
+    std::env::current_exe().map_err(|e| e.to_string())
 }
 
 /// Caminho fixo do app, para hooks e autostart não dependerem da pasta de build.
@@ -225,6 +235,51 @@ fn is_ours(group: &Value) -> bool {
     })
 }
 
+/// Hooks instalados e apontando para `hook_exe()`, por agente.
+pub struct HooksStatus {
+    pub claude: bool,
+    pub codex: bool,
+}
+
+pub fn status() -> HooksStatus {
+    let Ok(exe) = hook_exe() else {
+        return HooksStatus {
+            claude: false,
+            codex: false,
+        };
+    };
+    let ok = |agent: &str| {
+        targets()
+            .into_iter()
+            .find(|t| t.agent == agent)
+            .is_some_and(|t| {
+                let text = std::fs::read_to_string(&t.path).unwrap_or_default();
+                has_hooks(&text, t.events, &hook_command(&exe, agent))
+            })
+    };
+    HooksStatus {
+        claude: ok("claude"),
+        codex: ok("codex"),
+    }
+}
+
+/// Todo evento tem um hook com exatamente `cmd`. Hook apontando para outro exe (pasta antiga,
+/// build de dev) conta como faltando: aquele exe pode sumir e os eventos param de chegar.
+pub fn has_hooks(text: &str, events: &[(&str, bool)], cmd: &str) -> bool {
+    let Ok(root) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    events.iter().all(|(event, _)| {
+        root["hooks"][event].as_array().is_some_and(|groups| {
+            groups.iter().any(|g| {
+                g["hooks"]
+                    .as_array()
+                    .is_some_and(|hooks| hooks.iter().any(|h| h["command"] == cmd))
+            })
+        })
+    })
+}
+
 /// Tira as entradas antigas do pets e, com `cmd`, põe as novas no fim de cada evento.
 pub fn merge(text: &str, events: &[(&str, bool)], cmd: Option<&str>) -> Result<String, String> {
     let mut root: Value = if text.trim().is_empty() {
@@ -327,6 +382,21 @@ mod tests {
             v["hooks"]["Interrupt"][0]["hooks"][0]["command"],
             "pets.exe hook codex"
         );
+    }
+
+    #[test]
+    fn status_requires_every_event_pointing_to_this_exe() {
+        assert!(!has_hooks(ORCA, CLAUDE_EVENTS, CMD));
+        let installed = merge(ORCA, CLAUDE_EVENTS, Some(CMD)).unwrap();
+        assert!(has_hooks(&installed, CLAUDE_EVENTS, CMD));
+        assert!(!has_hooks(
+            &installed,
+            CLAUDE_EVENTS,
+            "C:/outro/pets.exe hook claude"
+        ));
+        let partial = merge(ORCA, &CLAUDE_EVENTS[..3], Some(CMD)).unwrap();
+        assert!(!has_hooks(&partial, CLAUDE_EVENTS, CMD));
+        assert!(!has_hooks("", CLAUDE_EVENTS, CMD));
     }
 
     #[test]

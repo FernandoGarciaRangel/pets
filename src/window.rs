@@ -1061,12 +1061,24 @@ impl App {
             append(menu, MF_SEPARATOR, 0, "");
             append(menu, MF_STRING, ID_OPEN_DIR, "Abrir pasta dos pets");
             append(menu, MF_STRING, ID_RELOAD, "Recarregar pets");
-            append(
-                menu,
-                MF_STRING,
-                ID_INSTALL,
-                "Instalar hooks (Claude Code + Codex)",
+            // Só vira ação quando falta algum: o install e as atualizações já instalam os hooks.
+            let hooks = install::status();
+            let mark = |ok: bool| if ok { "✓" } else { "✗" };
+            let marks = format!(
+                "Claude {} · Codex {}",
+                mark(hooks.claude),
+                mark(hooks.codex)
             );
+            if hooks.claude && hooks.codex {
+                append(menu, MF_STRING | MF_GRAYED, 0, &format!("Hooks: {marks}"));
+            } else {
+                append(
+                    menu,
+                    MF_STRING,
+                    ID_INSTALL,
+                    &format!("Reinstalar hooks ({marks})"),
+                );
+            }
             append(menu, MF_SEPARATOR, 0, "");
             append(
                 menu,
