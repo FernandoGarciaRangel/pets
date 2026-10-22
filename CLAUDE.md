@@ -42,6 +42,7 @@ Pet format (`pets.rs`):
 - With no `frame` or `animations` in the manifest and a Codex grid sheet (1536 px wide, 208 px rows, 9 or more rows), the Codex layout and timing table applies: 192×208 frames, 9 named animations.
 - Otherwise it uses the explicit layout, validated the same way Orca does, or falls back to a single static frame.
 - `sprite.rs` decodes the sheet once, crops and scales only the frames actually used, then drops the sheet.
+- Resizing with the mouse wheel (`resize_by`) keeps `sprite::Cells` (the cropped frames at their original resolution) in memory while you scroll and uses a fast filter. 600 ms after the last notch, `finish_resize` rebuilds the frames with the final filter, frees the `Cells` and saves the config. Windows coalesces rapid wheel events (one delta of 360 for three notches), which `resize_by` handles as fractional notches.
 
 Installation (`install.rs`):
 - `merge` is pure and tested. It adds this app's hook groups to `~/.claude/settings.json` and `~/.codex/hooks.json` without touching other apps' hooks (Orca, Codenotch). It recognizes its own groups by a command containing `pets.exe` + ` hook `.

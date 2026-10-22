@@ -5,7 +5,8 @@ Pets do Codex flutuando em qualquer tela do Windows, reagindo ao que o **Claude 
 - Um exe nativo em Rust (~750 KB, ~20 MB de RAM, CPU ≈ 0% parado): janela Win32 layered, sem webview nem GPU.
 - Fica sempre no topo, em qualquer monitor; arraste para onde quiser e a posição é lembrada.
 - Usa os pets que já estão em `~/.codex/pets/<pet>/` (`pet.json` + `spritesheet.webp`, o formato do Codex).
-- Controle pelo ícone na bandeja ou com o clique direito no pet: trocar pet, tamanho, esconder, iniciar com o Windows.
+- Controle pelo ícone na bandeja ou com o clique direito no pet: trocar pet, esconder, iniciar com o Windows.
+- Tamanho livre: role o mouse sobre o pet (48–512 px, 10% por passo).
 
 ## Animações
 

@@ -23,8 +23,25 @@ pub struct Sprite {
     pub icon: Vec<u8>,
 }
 
-impl Sprite {
-    pub fn build(pet_dir: &Path, target_width: u32) -> Result<Sprite, String> {
+/// Filtro de escala: `Fast` durante o ajuste com a roda do mouse, `Final` quando ele termina.
+#[derive(Clone, Copy)]
+pub enum Quality {
+    Fast,
+    Final,
+}
+
+/// Quadros recortados no tamanho original da folha. Guardados só enquanto o usuário
+/// redimensiona, para não decodificar a spritesheet a cada passo da roda.
+pub struct Cells {
+    frame_w: u32,
+    frame_h: u32,
+    default: String,
+    anims: Vec<(String, Vec<(RgbaImage, u32)>)>,
+    icon: Vec<u8>,
+}
+
+impl Cells {
+    pub fn load(pet_dir: &Path) -> Result<Cells, String> {
         let manifest = pets::read_manifest(pet_dir)?;
         let sheet_path = pets::sheet_path(pet_dir, &manifest)?;
         let sheet = image::ImageReader::open(&sheet_path)
@@ -37,10 +54,6 @@ impl Sprite {
         let layout = pets::resolve_layout(&manifest, sheet.width(), sheet.height())?;
 
         let (fw, fh) = (layout.frame_w, layout.frame_h);
-        let width = target_width.max(16);
-        let height = ((fh as f64) * (width as f64) / (fw as f64))
-            .round()
-            .max(1.0) as u32;
         let anims = layout
             .animations
             .iter()
@@ -52,11 +65,7 @@ impl Sprite {
                     .map(|(i, &duration_ms)| {
                         let cell = imageops::crop_imm(&sheet, i as u32 * fw, anim.row * fh, fw, fh)
                             .to_image();
-                        let scaled = imageops::resize(&cell, width, height, FilterType::CatmullRom);
-                        Frame {
-                            bgra: to_premultiplied_bgra(&scaled),
-                            duration_ms,
-                        }
+                        (cell, duration_ms)
                     })
                     .collect();
                 (name.clone(), frames)
@@ -65,13 +74,51 @@ impl Sprite {
 
         let first = &layout.animations[&layout.default];
         let icon_cell = imageops::crop_imm(&sheet, 0, first.row * fh, fw, fh).to_image();
-        Ok(Sprite {
-            width,
-            height,
+        Ok(Cells {
+            frame_w: fw,
+            frame_h: fh,
             default: layout.default,
             anims,
             icon: icon_bgra(&icon_cell),
         })
+    }
+
+    pub fn scale(&self, target_width: u32, quality: Quality) -> Sprite {
+        let width = target_width.max(16);
+        let height = ((self.frame_h as f64) * (width as f64) / (self.frame_w as f64))
+            .round()
+            .max(1.0) as u32;
+        let filter = match quality {
+            Quality::Fast => FilterType::Triangle,
+            Quality::Final => FilterType::CatmullRom,
+        };
+        let anims = self
+            .anims
+            .iter()
+            .map(|(name, cells)| {
+                let frames = cells
+                    .iter()
+                    .map(|(cell, duration_ms)| Frame {
+                        bgra: to_premultiplied_bgra(&imageops::resize(cell, width, height, filter)),
+                        duration_ms: *duration_ms,
+                    })
+                    .collect();
+                (name.clone(), frames)
+            })
+            .collect();
+        Sprite {
+            width,
+            height,
+            default: self.default.clone(),
+            anims,
+            icon: self.icon.clone(),
+        }
+    }
+}
+
+impl Sprite {
+    pub fn build(pet_dir: &Path, target_width: u32) -> Result<Sprite, String> {
+        Ok(Cells::load(pet_dir)?.scale(target_width, Quality::Final))
     }
 
     /// A animação pedida, ou a padrão do pet quando ele não tem aquela linha.

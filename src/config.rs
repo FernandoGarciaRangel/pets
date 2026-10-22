@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const SIZE_PRESETS: [u32; 5] = [96, 128, 160, 192, 256];
+pub const MIN_WIDTH: u32 = 48;
+pub const MAX_WIDTH: u32 = 512;
+pub const DEFAULT_WIDTH: u32 = 160;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -22,7 +24,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             pet: None,
-            width: 160,
+            width: DEFAULT_WIDTH,
             x: None,
             y: None,
             visible: true,
@@ -43,7 +45,11 @@ impl Config {
     pub fn load() -> Self {
         std::fs::read_to_string(Self::path())
             .ok()
-            .and_then(|text| toml::from_str(&text).ok())
+            .and_then(|text| toml::from_str::<Config>(&text).ok())
+            .map(|mut cfg| {
+                cfg.width = cfg.width.clamp(MIN_WIDTH, MAX_WIDTH);
+                cfg
+            })
             .unwrap_or_default()
     }
 

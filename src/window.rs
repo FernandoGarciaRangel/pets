@@ -3,10 +3,10 @@
 
 use crate::agents::{self, HookEvent, Sessions};
 use crate::animation::{self, AgentState, Drag};
-use crate::config::{Config, SIZE_PRESETS};
+use crate::config::{Config, DEFAULT_WIDTH, MAX_WIDTH, MIN_WIDTH};
 use crate::install;
 use crate::pets::{self, PetInfo};
-use crate::sprite::Sprite;
+use crate::sprite::{Cells, Quality, Sprite};
 use crate::system::{self, wide};
 use crate::tray::Tray;
 use crate::update::{self, CheckResult, Release};
@@ -46,6 +46,11 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const TIMER_FRAME: usize = 1;
 const TIMER_STATE: usize = 2;
 const TIMER_UPDATE: usize = 3;
+const TIMER_RESIZE: usize = 4;
+/// Depois de parar de rolar a roda: refaz os quadros na qualidade final e solta os `Cells`.
+const RESIZE_SETTLE_MS: u32 = 600;
+/// Cada passo da roda muda o tamanho em 10%.
+const WHEEL_STEP: f64 = 1.1;
 /// Deslocamento mínimo (px) para um clique virar arrasto.
 const DRAG_SLOP: i32 = 3;
 
@@ -59,7 +64,7 @@ const ID_CHECK_UPDATE: u32 = 16;
 const ID_AUTO_UPDATE: u32 = 17;
 const ID_QUIT: u32 = 99;
 const ID_PET_BASE: u32 = 1000;
-const ID_SIZE_BASE: u32 = 2000;
+const ID_SIZE_RESET: u32 = 18;
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -167,6 +172,7 @@ struct App {
     update: Option<Release>,
     notified_version: Option<String>,
     updating: bool,
+    resize_cells: Option<Cells>,
 }
 
 pub fn run() {
@@ -434,6 +440,7 @@ impl App {
             update: None,
             notified_version: None,
             updating: false,
+            resize_cells: None,
             cfg,
         }
     }
@@ -588,6 +595,7 @@ impl App {
             .cloned();
         self.sprite = None;
         self.dib = None;
+        self.resize_cells = None;
         self.error = None;
         self.anim.clear();
         self.frame = 0;
@@ -613,6 +621,58 @@ impl App {
         let tip = self.tip();
         self.tray.update(icon.as_deref(), &tip);
         self.apply_visibility();
+    }
+
+    /// Novo tamanho a partir da roda do mouse; `notches` é positivo para aumentar.
+    fn resize_by(&mut self, notches: f64) {
+        let target = (self.cfg.width as f64 * WHEEL_STEP.powf(notches)).round() as u32;
+        let target = target.clamp(MIN_WIDTH, MAX_WIDTH);
+        if target == self.cfg.width || self.sprite.is_none() {
+            return;
+        }
+        if self.resize_cells.is_none() {
+            let dir = self
+                .cfg
+                .pet
+                .as_ref()
+                .and_then(|id| self.pets.iter().find(|p| &p.id == id))
+                .map(|p| p.dir.clone());
+            self.resize_cells = dir.and_then(|d| Cells::load(&d).ok());
+        }
+        let Some(cells) = &self.resize_cells else {
+            return;
+        };
+        self.cfg.width = target;
+        let sprite = cells.scale(target, Quality::Fast);
+        self.install_resized(sprite);
+        // SAFETY: timer da nossa janela; SetTimer com o mesmo id reinicia a contagem.
+        unsafe { SetTimer(self.hwnd, TIMER_RESIZE, RESIZE_SETTLE_MS, None) };
+    }
+
+    fn finish_resize(&mut self) {
+        // SAFETY: timer da nossa janela.
+        unsafe { KillTimer(self.hwnd, TIMER_RESIZE) };
+        if let Some(cells) = self.resize_cells.take() {
+            let sprite = cells.scale(self.cfg.width, Quality::Final);
+            self.install_resized(sprite);
+        }
+        self.cfg.save();
+    }
+
+    /// Troca os quadros mantendo animação, quadro atual e os pés do pet no lugar.
+    fn install_resized(&mut self, sprite: Sprite) {
+        let old_size = self.size();
+        self.dib = Dib::new(sprite.width, sprite.height);
+        self.sprite = Some(sprite);
+        if let (Some((ow, oh)), Some((nw, nh))) = (old_size, self.size()) {
+            self.pos.x += (ow - nw) / 2;
+            self.pos.y += oh - nh;
+            self.move_to(self.pos);
+        }
+        if self.frame >= self.frames_len() {
+            self.frame = 0;
+        }
+        self.render();
     }
 
     fn tip(&self) -> String {
@@ -835,6 +895,7 @@ impl App {
                     spawn_check(self.hwnd, false, Duration::ZERO)
                 }
                 TIMER_UPDATE => {}
+                TIMER_RESIZE => self.finish_resize(),
                 _ => return Outcome::Default,
             },
             WM_APP_HOOK => {
@@ -882,6 +943,13 @@ impl App {
                 self.refresh_anim();
             }
             WM_MOUSEMOVE => self.on_mouse_move(),
+            WM_MOUSEWHEEL => {
+                let delta = ((wp >> 16) & 0xffff) as u16 as i16;
+                if cfg!(debug_assertions) {
+                    eprintln!("[wheel] wp=0x{wp:x} delta={delta} width={}", self.cfg.width);
+                }
+                self.resize_by(delta as f64 / WHEEL_DELTA as f64);
+            }
             WM_LBUTTONUP => {
                 self.end_drag();
                 // SAFETY: solta a captura; o WM_CAPTURECHANGED reentrante cai no DefWindowProc.
@@ -955,14 +1023,23 @@ impl App {
             append_submenu(menu, pets_menu, "Pet");
 
             let size_menu = CreatePopupMenu();
-            for (i, px) in SIZE_PRESETS.iter().enumerate() {
-                append(
-                    size_menu,
-                    MF_STRING | checked(*px == self.cfg.width),
-                    ID_SIZE_BASE + i as u32,
-                    &format!("{px} px"),
-                );
-            }
+            append(
+                size_menu,
+                MF_STRING | MF_GRAYED,
+                0,
+                &format!("{} px — role o mouse sobre o pet", self.cfg.width),
+            );
+            append(
+                size_menu,
+                MF_STRING
+                    | if self.cfg.width == DEFAULT_WIDTH {
+                        MF_GRAYED
+                    } else {
+                        0
+                    },
+                ID_SIZE_RESET,
+                &format!("Restaurar padrão ({DEFAULT_WIDTH} px)"),
+            );
             append_submenu(menu, size_menu, "Tamanho");
 
             append(
@@ -1040,8 +1117,8 @@ impl App {
                 self.load_pet();
                 self.cfg.save();
             }
-            id if (ID_SIZE_BASE..ID_SIZE_BASE + SIZE_PRESETS.len() as u32).contains(&id) => {
-                self.cfg.width = SIZE_PRESETS[(id - ID_SIZE_BASE) as usize];
+            ID_SIZE_RESET => {
+                self.cfg.width = DEFAULT_WIDTH;
                 self.load_pet();
                 self.cfg.save();
             }
