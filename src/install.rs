@@ -109,6 +109,7 @@ pub fn install_app() -> Result<String, String> {
         crate::system::set_autostart_exe(Some(&dest));
         lines.push("iniciar com o Windows agora aponta para a cópia instalada".into());
     }
+    lines.push(create_shortcuts(&dest));
     spawn_detached(&dest, &[])?;
     lines.push(if was_running {
         "pet reiniciado".into()
@@ -116,6 +117,38 @@ pub fn install_app() -> Result<String, String> {
         "pet iniciado".into()
     });
     Ok(lines.join("\n"))
+}
+
+/// Menu Iniciar a cada instalação (mantém o caminho certo); área de trabalho só uma vez, para
+/// não recriar a cada atualização um atalho que o usuário apagou. Falha aqui não impede o install.
+fn create_shortcuts(exe: &Path) -> String {
+    use crate::system::{ShortcutDir, create_shortcut};
+    let mut cfg = crate::config::Config::load();
+    let mut done = Vec::new();
+    let mut errors = Vec::new();
+    match create_shortcut(ShortcutDir::Special("Programs"), exe) {
+        Ok(()) => done.push("Menu Iniciar"),
+        Err(e) => errors.push(format!("Menu Iniciar: {e}")),
+    }
+    if !cfg.desktop_shortcut_created {
+        match create_shortcut(ShortcutDir::Special("Desktop"), exe) {
+            Ok(()) => {
+                done.push("área de trabalho");
+                cfg.desktop_shortcut_created = true;
+                cfg.save();
+            }
+            Err(e) => errors.push(format!("área de trabalho: {e}")),
+        }
+    }
+    let mut line = if done.is_empty() {
+        "atalhos não criados".to_string()
+    } else {
+        format!("atalho em: {}", done.join(" e "))
+    };
+    if !errors.is_empty() {
+        line.push_str(&format!(" (aviso: {})", errors.join("; ")));
+    }
+    line
 }
 
 /// Why: se o pet herdar o stdout redirecionado de quem chamou o install, o chamador fica

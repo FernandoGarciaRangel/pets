@@ -35,7 +35,9 @@ Baixe o zip da [última release](../../releases/latest), extraia e rode:
 ```
 
 Isso copia o exe para `%LOCALAPPDATA%\Programs\Pets`, adiciona os hooks em `~/.claude/settings.json` e
-`~/.codex/hooks.json` (com backup `.bak-pets`, sem mexer em hooks de outros apps) e sobe o pet.
+`~/.codex/hooks.json` (com backup `.bak-pets`, sem mexer em hooks de outros apps), cria o atalho **Pets** no
+Menu Iniciar e na área de trabalho e sobe o pet. O atalho da área de trabalho é criado uma vez só: se você
+apagar, as atualizações não recriam.
 O Codex pode pedir para confiar nos hooks novos na próxima sessão.
 
 Para tirar os hooks: `pets.exe uninstall-hooks`.

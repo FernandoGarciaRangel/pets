@@ -52,7 +52,8 @@ Installation (`install.rs`):
 - `merge` is pure and tested. It adds this app's hook groups to `~/.claude/settings.json` and `~/.codex/hooks.json` without touching other apps' hooks (Orca, Codenotch). It recognizes its own groups by a command containing `pets.exe` + ` hook `.
 - It writes a `.bak-pets` backup first. `serde_json` uses `preserve_order` so the user's key order survives.
 - The hooks always point at the installed copy when it exists (`hook_exe`), even if the app is running from a dev build. The menu shows `install::status()` (Claude/Codex ✓/✗) and only offers "Reinstalar hooks" when something is missing or points at another exe.
-- `install` copies the exe to `%LOCALAPPDATA%\Programs\Pets\pets.exe` (renaming the old exe aside first, which works even while it is running), reinstalls the hooks pointing at that copy, and starts the app detached.
+- `install` copies the exe to `%LOCALAPPDATA%\Programs\Pets\pets.exe` (renaming the old exe aside first, which works even while it is running), reinstalls the hooks pointing at that copy, creates the shortcuts and starts the app detached.
+- Shortcuts (`system::create_shortcut`): `Pets.lnk` is created through WScript.Shell from a PowerShell without a window, because windows-sys has no IShellLink COM interfaces. The folders come from `[Environment]::GetFolderPath`, because the Desktop can be redirected to OneDrive. The Start Menu shortcut is created on every install or update; the desktop one only once (`config.desktop_shortcut_created`), so an update never recreates a shortcut the user deleted. A failure here does not abort the install.
 
 Updates (`update.rs`):
 - The app checks `api.github.com/repos/FernandoGarciaRangel/pets/releases/latest` on startup (after 10 s) and every 6 h, using WinHTTP from a separate thread.

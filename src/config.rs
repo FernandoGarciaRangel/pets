@@ -20,6 +20,8 @@ pub struct Config {
     pub check_updates: bool,
     /// Pets embutidos já instalados uma vez; não são reinstalados se o usuário apagar.
     pub installed_builtins: Vec<String>,
+    /// O atalho da área de trabalho já foi criado uma vez; se o usuário apagar, não volta.
+    pub desktop_shortcut_created: bool,
 }
 
 impl Default for Config {
@@ -33,6 +35,7 @@ impl Default for Config {
             pets_dir: None,
             check_updates: true,
             installed_builtins: Vec::new(),
+            desktop_shortcut_created: false,
         }
     }
 }
