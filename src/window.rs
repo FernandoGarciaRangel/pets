@@ -49,6 +49,9 @@ const TIMER_FRAME: usize = 1;
 const TIMER_STATE: usize = 2;
 const TIMER_UPDATE: usize = 3;
 const TIMER_RESIZE: usize = 4;
+const TIMER_RESIZE_PREVIEW: usize = 5;
+/// O slider manda dezenas de eventos por segundo; aplica o mais recente no máximo a cada ~16 ms.
+const RESIZE_PREVIEW_MS: u32 = 16;
 /// Depois de parar de rolar a roda: refaz os quadros na qualidade final e solta os `Cells`.
 const RESIZE_SETTLE_MS: u32 = 600;
 /// Deslocamento mínimo (px) para um clique virar arrasto.
@@ -188,6 +191,8 @@ struct App {
     notified_version: Option<String>,
     updating: bool,
     resize_cells: Option<Cells>,
+    pending_width: Option<u32>,
+    preview_armed: bool,
     pet_updates: Vec<PetUpdate>,
     notified_pets: Vec<String>,
     updating_pets: bool,
@@ -443,7 +448,7 @@ fn spawn_check(hwnd: HWND, manual: bool, delay: Duration, pets: Vec<PetInfo>) {
 
 /// O slider do painel mudou: redimensiona ao vivo (filtro rápido).
 pub fn preview_width(width: u32) {
-    with_app(|app| app.resize_to(width));
+    with_app(|app| app.queue_resize(width));
 }
 
 /// O painel fechou: refaz em qualidade final e salva.
@@ -488,6 +493,8 @@ impl App {
             notified_version: None,
             updating: false,
             resize_cells: None,
+            pending_width: None,
+            preview_armed: false,
             pet_updates: Vec::new(),
             notified_pets: Vec::new(),
             updating_pets: false,
@@ -763,7 +770,28 @@ impl App {
         self.apply_visibility();
     }
 
-    /// Novo tamanho vindo do slider; refeito em qualidade final depois de `RESIZE_SETTLE_MS` parado.
+    /// Prévia do slider: só a animação atual, com filtro rápido; tudo em qualidade final depois
+    /// de `RESIZE_SETTLE_MS` parado.
+    fn queue_resize(&mut self, target: u32) {
+        self.pending_width = Some(target);
+        // Why: não rearma um timer pendente; rearmar a cada evento adiaria a prévia enquanto o
+        // usuário arrasta sem parar.
+        if !self.preview_armed {
+            self.preview_armed = true;
+            // SAFETY: timer da nossa janela.
+            unsafe { SetTimer(self.hwnd, TIMER_RESIZE_PREVIEW, RESIZE_PREVIEW_MS, None) };
+        }
+    }
+
+    fn apply_pending_resize(&mut self) {
+        // SAFETY: timer da nossa janela.
+        unsafe { KillTimer(self.hwnd, TIMER_RESIZE_PREVIEW) };
+        self.preview_armed = false;
+        if let Some(width) = self.pending_width.take() {
+            self.resize_to(width);
+        }
+    }
+
     fn resize_to(&mut self, target: u32) {
         let target = target.clamp(MIN_WIDTH, MAX_WIDTH);
         if target == self.cfg.width || self.sprite.is_none() {
@@ -782,20 +810,29 @@ impl App {
             return;
         };
         self.cfg.width = target;
-        let sprite = cells.scale(target, Quality::Fast);
+        let sprite = cells.scale_only(target, &self.anim, Quality::Fast);
         self.install_resized(sprite);
         // SAFETY: timer da nossa janela; SetTimer com o mesmo id reinicia a contagem.
         unsafe { SetTimer(self.hwnd, TIMER_RESIZE, RESIZE_SETTLE_MS, None) };
     }
 
-    fn finish_resize(&mut self) {
+    /// Parou de arrastar: todas as animações em qualidade final. Os `Cells` ficam enquanto o
+    /// painel está aberto, para o próximo movimento não decodificar a spritesheet de novo.
+    fn settle_resize(&mut self) {
         // SAFETY: timer da nossa janela.
         unsafe { KillTimer(self.hwnd, TIMER_RESIZE) };
-        if let Some(cells) = self.resize_cells.take() {
+        if let Some(cells) = &self.resize_cells {
             let sprite = cells.scale(self.cfg.width, Quality::Final);
             self.install_resized(sprite);
         }
         self.cfg.save();
+    }
+
+    /// O painel fechou: aplica o último valor, acerta a qualidade e solta a memória extra.
+    fn finish_resize(&mut self) {
+        self.apply_pending_resize();
+        self.settle_resize();
+        self.resize_cells = None;
     }
 
     /// Troca os quadros mantendo animação, quadro atual e os pés do pet no lugar.
@@ -1034,7 +1071,8 @@ impl App {
                     spawn_check(self.hwnd, false, Duration::ZERO, self.pets.clone())
                 }
                 TIMER_UPDATE => {}
-                TIMER_RESIZE => self.finish_resize(),
+                TIMER_RESIZE => self.settle_resize(),
+                TIMER_RESIZE_PREVIEW => self.apply_pending_resize(),
                 _ => return Outcome::Default,
             },
             WM_APP_HOOK => {
@@ -1166,14 +1204,40 @@ impl App {
             if self.pets.is_empty() {
                 append(pets_menu, MF_STRING | MF_GRAYED, 0, "Nenhum pet encontrado");
             }
-            for (i, pet) in self.pets.iter().enumerate() {
+            // Os que vêm com o app primeiro, na ordem de `BUILTIN`; depois os do usuário.
+            let builtin_rank = |id: &str| builtin::BUILTIN.iter().position(|b| b.id == id);
+            let mut ours: Vec<(usize, &PetInfo)> = self
+                .pets
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| builtin_rank(&p.id).is_some())
+                .collect();
+            ours.sort_by_key(|(_, p)| builtin_rank(&p.id));
+            let theirs: Vec<(usize, &PetInfo)> = self
+                .pets
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| builtin_rank(&p.id).is_none())
+                .collect();
+            let add_pet = |(i, pet): &(usize, &PetInfo)| {
                 let on = self.cfg.pet.as_deref() == Some(pet.id.as_str());
                 append(
                     pets_menu,
                     MF_STRING | checked(on),
-                    ID_PET_BASE + i as u32,
+                    ID_PET_BASE + *i as u32,
                     &pet.label,
                 );
+            };
+            if !ours.is_empty() {
+                append(pets_menu, MF_STRING | MF_GRAYED, 0, "Do Pets");
+                ours.iter().for_each(add_pet);
+            }
+            if !theirs.is_empty() {
+                if !ours.is_empty() {
+                    append(pets_menu, MF_SEPARATOR, 0, "");
+                    append(pets_menu, MF_STRING | MF_GRAYED, 0, "Seus pets");
+                }
+                theirs.iter().for_each(add_pet);
             }
             append_submenu(menu, pets_menu, "Pet");
 

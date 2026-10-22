@@ -84,6 +84,28 @@ impl Cells {
     }
 
     pub fn scale(&self, target_width: u32, quality: Quality) -> Sprite {
+        self.scale_where(target_width, quality, |_| true)
+    }
+
+    /// Só a animação `name` (ou a padrão, se o pet não tiver essa): é o que aparece na tela
+    /// enquanto o slider se move, e custa uma fração de escalar todas.
+    pub fn scale_only(&self, target_width: u32, name: &str, quality: Quality) -> Sprite {
+        let name = if self.anims.iter().any(|(n, _)| n == name) {
+            name.to_string()
+        } else {
+            self.default.clone()
+        };
+        let mut sprite = self.scale_where(target_width, quality, |n| n == name);
+        sprite.default = name;
+        sprite
+    }
+
+    fn scale_where(
+        &self,
+        target_width: u32,
+        quality: Quality,
+        keep: impl Fn(&str) -> bool,
+    ) -> Sprite {
         let width = target_width.max(16);
         let height = ((self.frame_h as f64) * (width as f64) / (self.frame_w as f64))
             .round()
@@ -95,6 +117,7 @@ impl Cells {
         let anims = self
             .anims
             .iter()
+            .filter(|(name, _)| keep(name))
             .map(|(name, cells)| {
                 let frames = cells
                     .iter()
@@ -174,6 +197,33 @@ mod tests {
             to_premultiplied_bgra(&img),
             vec![0, 128, 255, 255, 0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn scale_only_keeps_just_the_visible_animation() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/pets/tatu-canastra");
+        let cells = Cells::load(&dir).unwrap();
+        let full = cells.scale(120, Quality::Fast);
+        let only = cells.scale_only(120, "running", Quality::Fast);
+        assert_eq!(only.anims.len(), 1);
+        assert_eq!(only.default, "running");
+        assert_eq!(only.frames("running").len(), full.frames("running").len());
+        // Pedir uma animação que o pet não tem cai na padrão, e `frames` continua achando quadros.
+        let fallback = cells.scale_only(120, "nao-existe", Quality::Fast);
+        assert_eq!(fallback.default, full.default);
+        assert!(!fallback.frames("qualquer").is_empty());
+
+        let t = std::time::Instant::now();
+        for w in 100..120 {
+            cells.scale_only(w, "running", Quality::Fast);
+        }
+        let partial = t.elapsed() / 20;
+        let t = std::time::Instant::now();
+        for w in 100..105 {
+            cells.scale(w, Quality::Fast);
+        }
+        let all = t.elapsed() / 5;
+        eprintln!("por passo do slider: só a animação {partial:?}, todas {all:?}");
     }
 
     #[test]

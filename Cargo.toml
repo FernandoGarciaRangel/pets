@@ -47,3 +47,7 @@ panic = "abort"
 # Decodificar e redimensionar a spritesheet em debug sem otimização leva segundos.
 [profile.dev.package."*"]
 opt-level = 3
+
+# O nosso código também: sem isso o premultiply do slider leva ~70 ms por passo no dev.
+[profile.dev]
+opt-level = 1

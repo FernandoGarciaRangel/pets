@@ -11,19 +11,26 @@ pub struct Builtin {
 
 pub const DEFAULT_PET: &str = "tatu-canastra";
 
-pub const BUILTIN: &[Builtin] = &[Builtin {
-    id: "tatu-canastra",
-    files: &[
-        (
-            "pet.json",
-            include_bytes!("../assets/pets/tatu-canastra/pet.json"),
-        ),
-        (
-            "spritesheet.webp",
-            include_bytes!("../assets/pets/tatu-canastra/spritesheet.webp"),
-        ),
-    ],
-}];
+/// Um pet de `assets/pets/<id>/`, no formato do Codex (`pet.json` + `spritesheet.webp`).
+macro_rules! builtin {
+    ($id:literal) => {
+        Builtin {
+            id: $id,
+            files: &[
+                (
+                    "pet.json",
+                    include_bytes!(concat!("../assets/pets/", $id, "/pet.json")),
+                ),
+                (
+                    "spritesheet.webp",
+                    include_bytes!(concat!("../assets/pets/", $id, "/spritesheet.webp")),
+                ),
+            ],
+        }
+    };
+}
+
+pub const BUILTIN: &[Builtin] = &[builtin!("tatu-canastra"), builtin!("fluxo")];
 
 /// Instala os embutidos que ainda não foram instalados. `done` são os ids já instalados antes
 /// (vêm do config); devolve os que entraram agora.
@@ -59,13 +66,22 @@ mod tests {
     fn builtin_pets_are_valid_codex_pets() {
         let root = std::env::temp_dir().join(format!("pets-builtin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(install_missing(&root, &[]), vec![DEFAULT_PET.to_string()]);
-        let sprite = crate::sprite::Sprite::build(&root.join(DEFAULT_PET), 160).unwrap();
-        assert!(sprite.has("idle") && sprite.has("running") && sprite.has("waiting"));
+        let all: Vec<String> = BUILTIN.iter().map(|b| b.id.to_string()).collect();
+        assert!(all.iter().any(|id| id == DEFAULT_PET));
+        assert_eq!(install_missing(&root, &[]), all);
+        for id in &all {
+            let manifest = crate::pets::read_manifest(&root.join(id)).unwrap();
+            assert_eq!(manifest.id.as_deref(), Some(id.as_str()), "id do pet.json");
+            let sprite = crate::sprite::Sprite::build(&root.join(id), 160).unwrap();
+            assert!(
+                sprite.has("idle") && sprite.has("running") && sprite.has("waiting"),
+                "{id}"
+            );
+        }
 
         // Segunda vez não reinstala, e uma pasta apagada pelo usuário continua apagada.
         std::fs::remove_dir_all(root.join(DEFAULT_PET)).unwrap();
-        assert!(install_missing(&root, &[DEFAULT_PET.to_string()]).is_empty());
+        assert!(install_missing(&root, &all).is_empty());
         assert!(!root.join(DEFAULT_PET).exists());
         let _ = std::fs::remove_dir_all(&root);
     }

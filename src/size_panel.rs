@@ -44,9 +44,6 @@ fn set_text(hwnd: HWND, text: &str) {
 
 /// Abre o painel perto do pet (acima dele, ou abaixo se não couber). Se já estiver aberto, só traz para a frente.
 pub fn open(pet: HWND, width: u32) {
-    if cfg!(debug_assertions) {
-        eprintln!("[panel] open width={width}");
-    }
     let existing = PANEL.get();
     if !existing.is_null() {
         // SAFETY: janela nossa.
@@ -193,9 +190,6 @@ pub fn open(pet: HWND, width: u32) {
 }
 
 unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    if cfg!(debug_assertions) && matches!(msg, WM_ACTIVATE | WM_DESTROY | WM_CREATE) {
-        eprintln!("[panel] msg=0x{msg:x} wp=0x{wp:x}");
-    }
     // SAFETY: mensagens da nossa janela; os handles guardados pertencem a ela.
     unsafe {
         match msg {

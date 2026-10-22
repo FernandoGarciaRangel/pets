@@ -43,7 +43,9 @@ Pet format (`pets.rs`):
 - Otherwise it uses the explicit layout, validated the same way Orca does, or falls back to a single static frame.
 - `sprite.rs` decodes the sheet once, crops and scales only the frames actually used, then drops the sheet.
 - Size is set with a slider: the menu item "Tamanho…" opens `size_panel.rs`, a separate popup window with a comctl32 trackbar that closes when it loses focus or on Esc (handled in the message loop, since focus stays on the trackbar).
-- While you drag, `window::preview_width` → `resize_to` keeps `sprite::Cells` (the cropped frames at their original resolution) in memory and scales with a fast filter. 600 ms after the last change, or when the panel closes (`commit_width`), `finish_resize` rebuilds the frames with the final filter, frees the `Cells` and saves the config.
+- While you drag, `window::preview_width` → `queue_resize` coalesces the trackbar events (`TIMER_RESIZE_PREVIEW`, at most one every 16 ms, without re-arming a pending timer). `resize_to` then scales **only the visible animation** (`Cells::scale_only`, fast filter) from `sprite::Cells`, the cropped frames at their original resolution, kept in memory while the panel is open.
+- 600 ms after the last change, `settle_resize` rebuilds every animation with the final filter but keeps the `Cells`. When the panel closes (`commit_width` → `finish_resize`), the `Cells` are freed and the config is saved.
+- Cost per step: ~5 ms versus ~50 ms when scaling everything. `[profile.dev] opt-level = 1` keeps the dev build at that speed.
 - The panel is created outside the App borrow (`After::OpenSizePanel`).
 
 Installation (`install.rs`):
@@ -80,7 +82,7 @@ Config lives in `%APPDATA%\pets\config.toml` (`config.rs`).
 - **Installed hooks point at `%LOCALAPPDATA%\Programs\Pets\pets.exe`, not at `target/`.** To test a change through the real agents, run `./dev.ps1 -Install`.
 - Constants missing from the enabled `windows-sys` features (e.g. `TBM_GETPOS`, `SS_CENTERIMAGE`) are defined locally instead of enabling a whole feature.
 - `build.rs` embeds the Common Controls v6 manifest (for the modern slider and buttons) and compiles `pets.rc` (icon 1 = `assets/pets.ico`, the fox logo, used by `tray::app_icon`) via `embed-resource`, which needs the Windows SDK `rc.exe`.
-- Built-in pets (`builtin.rs`): only pets we have the right to distribute (originals of the project — today the tatu-canastra) are embedded with `include_bytes!`. Each one is installed into `pets_dir` **once** (`config.installed_builtins`): an existing folder is never overwritten, and a pet the user deleted is not recreated. `DEFAULT_PET` is used when no pet is configured.
+- Built-in pets (`builtin.rs`): only pets we have the right to distribute are embedded, using the `builtin!("<id>")` macro (which `include_bytes!` from `assets/pets/<id>/`). Today those are the tatu-canastra (`DEFAULT_PET`) and fluxo, both originals by the author. To add a pet: put its folder in `assets/pets/<id>/` and add it to `BUILTIN`; the test `builtin_pets_are_valid_codex_pets` validates every entry. The "Pet" submenu lists the built-ins first under "Do Pets", in `BUILTIN` order, then the user's pets under "Seus pets". Each one is installed into `pets_dir` **once** (`config.installed_builtins`): an existing folder is never overwritten, and a pet the user deleted is not recreated. `DEFAULT_PET` is used when no pet is configured.
 
 ## CI/CD
 
