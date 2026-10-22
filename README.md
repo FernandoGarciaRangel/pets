@@ -54,7 +54,7 @@ Pets instalados de **codex-pets.net**, **petdex.dev** ou **aimcp.info** (reposit
 Na primeira checagem cada pet é identificado pelo spritesheet idêntico ao do catálogo; pets criados localmente ou
 diferentes do catálogo ficam de fora e nunca são substituídos. Quando sai versão nova, o menu mostra
 **Atualizar pets (N)**; antes de trocar, o app valida a imagem nova e guarda os arquivos antigos em
-`%APPDATA%\petsackups`.
+`%APPDATA%\pets\backups`.
 
 ```powershell
 pets.exe check-pets    # situação de cada pet
