@@ -7,7 +7,7 @@ Pets do Codex flutuando em qualquer tela do Windows, reagindo ao que o **Claude 
 - Um exe nativo em Rust (~4,7 MB, dos quais ~3,8 MB são os pets embutidos; ~20 MB de RAM, CPU ≈ 0% parado): janela Win32 layered, sem webview nem GPU.
 - Fica sempre no topo, em qualquer monitor; arraste para onde quiser e a posição é lembrada.
 - Usa os pets que já estão em `~/.codex/pets/<pet>/` (`pet.json` + `spritesheet.webp`, o formato do Codex).
-- Controle pelo ícone na bandeja ou com o clique direito no pet: trocar pet, esconder, iniciar com o Windows.
+- Controle pelo ícone da raposa na bandeja ou com o clique direito no pet: trocar pet, esconder, iniciar com o Windows.
 - Tamanho livre: menu **Tamanho…** abre um slider (48–512 px) que redimensiona ao vivo.
 - Vem com uma biblioteca de pets originais do projeto, **Tatu-canastra** (o padrão) e **Draco**, instalados em
   `~/.codex/pets` na primeira execução e listados à parte no menu (**Do Pets** / **Seus pets**).

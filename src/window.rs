@@ -710,7 +710,7 @@ impl App {
 
     fn refresh_tip(&mut self) {
         let tip = self.tip();
-        self.tray.update(None, &tip);
+        self.tray.set_tip(&tip);
     }
 
     fn size(&self) -> Option<(i32, i32)> {
@@ -786,9 +786,8 @@ impl App {
             self.move_to(self.pos);
         }
         self.refresh_anim();
-        let icon = self.sprite.as_ref().map(|s| s.icon.clone());
         let tip = self.tip();
-        self.tray.update(icon.as_deref(), &tip);
+        self.tray.set_tip(&tip);
         self.apply_visibility();
     }
 
@@ -1040,7 +1039,7 @@ impl App {
             self.state = state;
             self.refresh_anim();
             let tip = self.tip();
-            self.tray.update(None, &tip);
+            self.tray.set_tip(&tip);
         }
         // SAFETY: timer da nossa janela.
         unsafe {
@@ -1193,7 +1192,7 @@ impl App {
             m if m == self.taskbar_created && m != 0 => {
                 self.tray.add();
                 let tip = self.tip();
-                self.tray.update(None, &tip);
+                self.tray.set_tip(&tip);
             }
             _ => return Outcome::Default,
         }

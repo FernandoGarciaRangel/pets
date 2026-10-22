@@ -28,7 +28,7 @@ A single exe plays two roles:
    - **Window:** layered Win32 window (`UpdateLayeredWindow` with premultiplied BGRA). Transparent pixels let clicks through without extra code.
    - **Animation:** a `SetTimer` fires only when the frame changes, using that frame's own duration.
    - **Single instance:** a named mutex. A second launch posts `WM_APP_SHOW` to the instance already running.
-   - **Tray** (`tray.rs`): the tray icon is generated from the pet's first frame.
+   - **Tray** (`tray.rs`): the tray icon is always the app logo (`tray::app_icon`, resource 1); the pet is already visible on screen.
 2. **Hook client** (`hook.rs`): the agents invoke `pets.exe hook claude|codex`. It reads the payload from stdin and writes one JSON line (`agents::HookEvent`) to the named pipe `\\.\pipe\pets-agent-state`, then exits. If the app is not running it exits silently. It must never block the agent or print to stdout.
 
 Data flow:

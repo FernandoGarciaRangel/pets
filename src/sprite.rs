@@ -7,8 +7,6 @@ use image::imageops::{self, FilterType};
 use std::collections::HashMap;
 use std::path::Path;
 
-pub const ICON_SIZE: u32 = 32;
-
 pub struct Frame {
     pub bgra: Vec<u8>,
     pub duration_ms: u32,
@@ -19,8 +17,6 @@ pub struct Sprite {
     pub height: u32,
     pub default: String,
     pub anims: HashMap<String, Vec<Frame>>,
-    /// Ícone da bandeja, 32×32 BGRA com alpha direto (ícones não usam pré-multiplicação).
-    pub icon: Vec<u8>,
 }
 
 /// Filtro de escala: `Fast` enquanto o slider de tamanho se move, `Final` quando ele para.
@@ -37,7 +33,6 @@ pub struct Cells {
     frame_h: u32,
     default: String,
     anims: Vec<(String, Vec<(RgbaImage, u32)>)>,
-    icon: Vec<u8>,
 }
 
 impl Cells {
@@ -72,14 +67,11 @@ impl Cells {
             })
             .collect();
 
-        let first = &layout.animations[&layout.default];
-        let icon_cell = imageops::crop_imm(&sheet, 0, first.row * fh, fw, fh).to_image();
         Ok(Cells {
             frame_w: fw,
             frame_h: fh,
             default: layout.default,
             anims,
-            icon: icon_bgra(&icon_cell),
         })
     }
 
@@ -134,7 +126,6 @@ impl Cells {
             height,
             default: self.default.clone(),
             anims,
-            icon: self.icon.clone(),
         }
     }
 }
@@ -166,24 +157,6 @@ fn to_premultiplied_bgra(img: &RgbaImage) -> Vec<u8> {
         out.extend_from_slice(&[premul(b), premul(g), premul(r), a]);
     }
     out
-}
-
-fn icon_bgra(cell: &RgbaImage) -> Vec<u8> {
-    let scale = ICON_SIZE as f64 / cell.width().max(cell.height()) as f64;
-    let w = ((cell.width() as f64 * scale).round() as u32).clamp(1, ICON_SIZE);
-    let h = ((cell.height() as f64 * scale).round() as u32).clamp(1, ICON_SIZE);
-    let scaled = imageops::resize(cell, w, h, FilterType::CatmullRom);
-    let mut canvas = RgbaImage::new(ICON_SIZE, ICON_SIZE);
-    imageops::overlay(
-        &mut canvas,
-        &scaled,
-        ((ICON_SIZE - w) / 2) as i64,
-        ((ICON_SIZE - h) / 2) as i64,
-    );
-    canvas
-        .pixels()
-        .flat_map(|p| [p.0[2], p.0[1], p.0[0], p.0[3]])
-        .collect()
 }
 
 #[cfg(test)]
@@ -239,6 +212,5 @@ mod tests {
         assert_eq!(sprite.height, 173);
         assert_eq!(sprite.frames("idle").len(), 6);
         assert_eq!(sprite.frames("idle")[0].bgra.len(), 160 * 173 * 4);
-        assert_eq!(sprite.icon.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
     }
 }
