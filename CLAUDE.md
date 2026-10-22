@@ -42,7 +42,9 @@ Pet format (`pets.rs`):
 - With no `frame` or `animations` in the manifest and a Codex grid sheet (1536 px wide, 208 px rows, 9 or more rows), the Codex layout and timing table applies: 192×208 frames, 9 named animations.
 - Otherwise it uses the explicit layout, validated the same way Orca does, or falls back to a single static frame.
 - `sprite.rs` decodes the sheet once, crops and scales only the frames actually used, then drops the sheet.
-- Resizing with the mouse wheel (`resize_by`) keeps `sprite::Cells` (the cropped frames at their original resolution) in memory while you scroll and uses a fast filter. 600 ms after the last notch, `finish_resize` rebuilds the frames with the final filter, frees the `Cells` and saves the config. Windows coalesces rapid wheel events (one delta of 360 for three notches), which `resize_by` handles as fractional notches.
+- Size is set with a slider: the menu item "Tamanho…" opens `size_panel.rs`, a separate popup window with a comctl32 trackbar that closes when it loses focus or on Esc (handled in the message loop, since focus stays on the trackbar).
+- While you drag, `window::preview_width` → `resize_to` keeps `sprite::Cells` (the cropped frames at their original resolution) in memory and scales with a fast filter. 600 ms after the last change, or when the panel closes (`commit_width`), `finish_resize` rebuilds the frames with the final filter, frees the `Cells` and saves the config.
+- The panel is created outside the App borrow (`After::OpenSizePanel`).
 
 Installation (`install.rs`):
 - `merge` is pure and tested. It adds this app's hook groups to `~/.claude/settings.json` and `~/.codex/hooks.json` without touching other apps' hooks (Orca, Codenotch). It recognizes its own groups by a command containing `pets.exe` + ` hook `.
@@ -76,7 +78,9 @@ Config lives in `%APPDATA%\pets\config.toml` (`config.rs`).
   - `Start-Process -Wait` also waits for child processes, so it hangs on `install`; that is why `dev.ps1` uses `System.Diagnostics.Process`.
   - CLI commands call `system::attach_console()` so their output shows up.
 - **Installed hooks point at `%LOCALAPPDATA%\Programs\Pets\pets.exe`, not at `target/`.** To test a change through the real agents, run `./dev.ps1 -Install`.
-- Constants missing from the enabled `windows-sys` features (e.g. `WM_MOUSELEAVE`) are defined locally instead of enabling a whole feature.
+- Constants missing from the enabled `windows-sys` features (e.g. `TBM_GETPOS`, `SS_CENTERIMAGE`) are defined locally instead of enabling a whole feature.
+- `build.rs` embeds the Common Controls v6 manifest (for the modern slider and buttons) and compiles `pets.rc` (icon 1 = `assets/pets.ico`, the fox logo, used by `tray::app_icon`) via `embed-resource`, which needs the Windows SDK `rc.exe`.
+- Built-in pets (`builtin.rs`): only pets we have the right to distribute (originals of the project — today the tatu-canastra) are embedded with `include_bytes!`. Each one is installed into `pets_dir` **once** (`config.installed_builtins`): an existing folder is never overwritten, and a pet the user deleted is not recreated. `DEFAULT_PET` is used when no pet is configured.
 
 ## CI/CD
 

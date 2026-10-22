@@ -1,12 +1,15 @@
+<p align="center"><img src="assets/logo.png" width="160" alt="Logo do Pets: rosto de uma raposinha laranja"></p>
+
 # Pets
 
 Pets do Codex flutuando em qualquer tela do Windows, reagindo ao que o **Claude Code** e o **Codex** estão fazendo.
 
-- Um exe nativo em Rust (~750 KB, ~20 MB de RAM, CPU ≈ 0% parado): janela Win32 layered, sem webview nem GPU.
+- Um exe nativo em Rust (~2,7 MB, dos quais ~1,8 MB são o pet embutido; ~20 MB de RAM, CPU ≈ 0% parado): janela Win32 layered, sem webview nem GPU.
 - Fica sempre no topo, em qualquer monitor; arraste para onde quiser e a posição é lembrada.
 - Usa os pets que já estão em `~/.codex/pets/<pet>/` (`pet.json` + `spritesheet.webp`, o formato do Codex).
 - Controle pelo ícone na bandeja ou com o clique direito no pet: trocar pet, esconder, iniciar com o Windows.
-- Tamanho livre: role o mouse sobre o pet (48–512 px, 10% por passo).
+- Tamanho livre: menu **Tamanho…** abre um slider (48–512 px) que redimensiona ao vivo.
+- Vem com o **tatu-canastra**, pet original do projeto, instalado em `~/.codex/pets` na primeira execução.
 
 ## Animações
 

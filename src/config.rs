@@ -18,6 +18,8 @@ pub struct Config {
     pub pets_dir: Option<PathBuf>,
     /// Procura versão nova no GitHub ao iniciar e a cada 6 h.
     pub check_updates: bool,
+    /// Pets embutidos já instalados uma vez; não são reinstalados se o usuário apagar.
+    pub installed_builtins: Vec<String>,
 }
 
 impl Default for Config {
@@ -30,6 +32,7 @@ impl Default for Config {
             visible: true,
             pets_dir: None,
             check_updates: true,
+            installed_builtins: Vec::new(),
         }
     }
 }

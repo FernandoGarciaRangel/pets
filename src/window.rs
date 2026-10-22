@@ -3,10 +3,12 @@
 
 use crate::agents::{self, HookEvent, Sessions};
 use crate::animation::{self, AgentState, Drag};
+use crate::builtin;
 use crate::catalog::{self, PetUpdate};
-use crate::config::{Config, DEFAULT_WIDTH, MAX_WIDTH, MIN_WIDTH};
+use crate::config::{Config, MAX_WIDTH, MIN_WIDTH};
 use crate::install;
 use crate::pets::{self, PetInfo};
+use crate::size_panel;
 use crate::sprite::{Cells, Quality, Sprite};
 use crate::system::{self, wide};
 use crate::tray::Tray;
@@ -27,6 +29,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
@@ -42,16 +45,12 @@ const WM_APP_TRAY: u32 = WM_APP + 2;
 const WM_APP_SHOW: u32 = WM_APP + 3;
 const WM_APP_QUIT: u32 = WM_APP + 4;
 const WM_APP_UPDATE: u32 = WM_APP + 5;
-// Fica em Win32_UI_Controls no windows-sys; não vale a feature inteira por uma constante.
-const WM_MOUSELEAVE: u32 = 0x02A3;
 const TIMER_FRAME: usize = 1;
 const TIMER_STATE: usize = 2;
 const TIMER_UPDATE: usize = 3;
 const TIMER_RESIZE: usize = 4;
 /// Depois de parar de rolar a roda: refaz os quadros na qualidade final e solta os `Cells`.
 const RESIZE_SETTLE_MS: u32 = 600;
-/// Cada passo da roda muda o tamanho em 10%.
-const WHEEL_STEP: f64 = 1.1;
 /// Deslocamento mínimo (px) para um clique virar arrasto.
 const DRAG_SLOP: i32 = 3;
 
@@ -67,7 +66,7 @@ const ID_PET_UPDATE_ALL: u32 = 19;
 const ID_PET_UPDATE_BASE: u32 = 3000;
 const ID_QUIT: u32 = 99;
 const ID_PET_BASE: u32 = 1000;
-const ID_SIZE_RESET: u32 = 18;
+const ID_SIZE_PANEL: u32 = 18;
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -165,6 +164,8 @@ enum After {
     Nothing,
     Message(String, bool),
     Quit,
+    /// O painel do slider é uma janela nova: abre fora do empréstimo do App.
+    OpenSizePanel(u32),
 }
 
 struct App {
@@ -214,6 +215,7 @@ pub fn run() {
         wc.lpfnWndProc = Some(wndproc);
         wc.hInstance = hinstance;
         wc.hCursor = LoadCursorW(null_mut(), IDC_HAND);
+        wc.hIcon = crate::tray::app_icon();
         wc.lpszClassName = class.as_ptr();
         RegisterClassExW(&wc);
 
@@ -245,6 +247,9 @@ pub fn run() {
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            if size_panel::close_on_escape(&msg) {
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
@@ -369,6 +374,7 @@ unsafe fn show_menu(hwnd: HWND) {
         match with_app(|app| app.on_command(cmd as u32)) {
             Some(After::Message(text, error)) => system::message_box(&text, error),
             Some(After::Quit) => PostQuitMessage(0),
+            Some(After::OpenSizePanel(width)) => size_panel::open(hwnd, width),
             _ => {}
         }
     }
@@ -435,13 +441,28 @@ fn spawn_check(hwnd: HWND, manual: bool, delay: Duration, pets: Vec<PetInfo>) {
     });
 }
 
+/// O slider do painel mudou: redimensiona ao vivo (filtro rápido).
+pub fn preview_width(width: u32) {
+    with_app(|app| app.resize_to(width));
+}
+
+/// O painel fechou: refaz em qualidade final e salva.
+pub fn commit_width() {
+    with_app(App::finish_resize);
+}
+
 fn checked(on: bool) -> u32 {
     if on { MF_CHECKED } else { MF_UNCHECKED }
 }
 
 impl App {
     fn new(hwnd: HWND) -> App {
-        let cfg = Config::load();
+        let mut cfg = Config::load();
+        let fresh = builtin::install_missing(&cfg.pets_dir(), &cfg.installed_builtins);
+        if !fresh.is_empty() {
+            cfg.installed_builtins.extend(fresh);
+            cfg.save();
+        }
         let pets = pets::discover(&cfg.pets_dir());
         let taskbar = wide("TaskbarCreated");
         App {
@@ -709,6 +730,7 @@ impl App {
             .pet
             .as_ref()
             .and_then(|id| self.pets.iter().find(|p| &p.id == id))
+            .or_else(|| self.pets.iter().find(|p| p.id == builtin::DEFAULT_PET))
             .or(self.pets.first())
             .cloned();
         self.sprite = None;
@@ -741,9 +763,8 @@ impl App {
         self.apply_visibility();
     }
 
-    /// Novo tamanho a partir da roda do mouse; `notches` é positivo para aumentar.
-    fn resize_by(&mut self, notches: f64) {
-        let target = (self.cfg.width as f64 * WHEEL_STEP.powf(notches)).round() as u32;
+    /// Novo tamanho vindo do slider; refeito em qualidade final depois de `RESIZE_SETTLE_MS` parado.
+    fn resize_to(&mut self, target: u32) {
         let target = target.clamp(MIN_WIDTH, MAX_WIDTH);
         if target == self.cfg.width || self.sprite.is_none() {
             return;
@@ -1064,13 +1085,6 @@ impl App {
                 self.refresh_anim();
             }
             WM_MOUSEMOVE => self.on_mouse_move(),
-            WM_MOUSEWHEEL => {
-                let delta = ((wp >> 16) & 0xffff) as u16 as i16;
-                if cfg!(debug_assertions) {
-                    eprintln!("[wheel] wp=0x{wp:x} delta={delta} width={}", self.cfg.width);
-                }
-                self.resize_by(delta as f64 / WHEEL_DELTA as f64);
-            }
             WM_LBUTTONUP => {
                 self.end_drag();
                 // SAFETY: solta a captura; o WM_CAPTURECHANGED reentrante cai no DefWindowProc.
@@ -1163,25 +1177,12 @@ impl App {
             }
             append_submenu(menu, pets_menu, "Pet");
 
-            let size_menu = CreatePopupMenu();
             append(
-                size_menu,
-                MF_STRING | MF_GRAYED,
-                0,
-                &format!("{} px — role o mouse sobre o pet", self.cfg.width),
+                menu,
+                MF_STRING,
+                ID_SIZE_PANEL,
+                &format!("Tamanho… ({} px)", self.cfg.width),
             );
-            append(
-                size_menu,
-                MF_STRING
-                    | if self.cfg.width == DEFAULT_WIDTH {
-                        MF_GRAYED
-                    } else {
-                        0
-                    },
-                ID_SIZE_RESET,
-                &format!("Restaurar padrão ({DEFAULT_WIDTH} px)"),
-            );
-            append_submenu(menu, size_menu, "Tamanho");
 
             append(
                 menu,
@@ -1276,11 +1277,7 @@ impl App {
                 self.load_pet();
                 self.cfg.save();
             }
-            ID_SIZE_RESET => {
-                self.cfg.width = DEFAULT_WIDTH;
-                self.load_pet();
-                self.cfg.save();
-            }
+            ID_SIZE_PANEL => return After::OpenSizePanel(self.cfg.width),
             _ => {}
         }
         if let Some(error) = self.error.clone() {

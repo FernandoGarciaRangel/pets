@@ -3,12 +3,14 @@
 
 mod agents;
 mod animation;
+mod builtin;
 mod catalog;
 mod config;
 mod hook;
 mod install;
 mod net;
 mod pets;
+mod size_panel;
 mod sprite;
 mod system;
 mod tray;

@@ -25,8 +25,8 @@ pub struct Tray {
 
 impl Tray {
     pub fn new(hwnd: HWND, message: u32) -> Self {
-        // SAFETY: ícone compartilhado do sistema; nunca é destruído.
-        let icon = unsafe { LoadIconW(null_mut(), IDI_APPLICATION) };
+        // Ícone do app até o pet carregar (ou se nenhum pet abrir).
+        let icon = app_icon();
         Tray {
             hwnd,
             message,
@@ -104,6 +104,24 @@ impl Tray {
             // SAFETY: ícone criado por nós em icon_from_bgra.
             unsafe { DestroyIcon(self.icon) };
             self.owns_icon = false;
+        }
+    }
+}
+
+/// A logo embutida no exe (recurso 1, de `pets.rc`); o ícone genérico do Windows se faltar.
+/// Ícones de recurso são compartilhados: nunca são destruídos.
+pub fn app_icon() -> HICON {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    // SAFETY: MAKEINTRESOURCE(1) no módulo do próprio exe.
+    unsafe {
+        let icon = LoadIconW(
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::without_provenance(1),
+        );
+        if icon.is_null() {
+            LoadIconW(null_mut(), IDI_APPLICATION)
+        } else {
+            icon
         }
     }
 }
