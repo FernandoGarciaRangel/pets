@@ -25,7 +25,56 @@ pub struct Manifest {
     pub frame: Option<FrameSize>,
     pub fps: Option<f64>,
     pub default_animation: Option<String>,
-    pub animations: Option<BTreeMap<String, AnimSpec>>,
+    #[serde(default, deserialize_with = "animations")]
+    pub animations: Option<Animations>,
+    #[serde(default)]
+    pub interactions: Interactions,
+}
+
+#[derive(Debug)]
+pub enum Animations {
+    /// Layout explícito do Orca: `row` + `frames`, junto com `frame`.
+    Explicit(BTreeMap<String, AnimSpec>),
+    /// Animações extras do Codex por cima da grade padrão: reusam uma linha nomeada
+    /// (`sourceRow`) com mais quadros que o estado normal usa.
+    Extras(BTreeMap<String, ExtraSpec>),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtraSpec {
+    pub source_row: String,
+    pub frame_count: u32,
+    pub timing_ms: Option<Vec<f64>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct Interactions {
+    pub click: Option<ClickSpec>,
+}
+
+/// Só o modo `cycle` existe hoje: cada clique toca a próxima da lista.
+#[derive(Debug, Default, Deserialize)]
+pub struct ClickSpec {
+    #[serde(default)]
+    pub animations: Vec<String>,
+}
+
+fn animations<'de, D>(d: D) -> Result<Option<Animations>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(raw) = Option::<BTreeMap<String, serde_json::Value>>::deserialize(d)? else {
+        return Ok(None);
+    };
+    let extras = raw.values().any(|v| v.get("sourceRow").is_some());
+    let parsed = serde_json::Value::Object(raw.into_iter().collect());
+    let animations = if extras {
+        Animations::Extras(serde_json::from_value(parsed).map_err(serde::de::Error::custom)?)
+    } else {
+        Animations::Explicit(serde_json::from_value(parsed).map_err(serde::de::Error::custom)?)
+    };
+    Ok(Some(animations))
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -62,16 +111,20 @@ pub struct Layout {
     pub frame_h: u32,
     pub default: String,
     pub animations: BTreeMap<String, Anim>,
+    /// Animações que o clique toca, em ciclo; só nomes que existem em `animations`.
+    pub click: Vec<String>,
 }
 
 pub fn discover(dir: &Path) -> Vec<PetInfo> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut pets: Vec<PetInfo> = entries
+    let mut pets: Vec<_> = entries
         .flatten()
         .filter(|e| e.path().join(MANIFEST_FILE).is_file())
         .map(|e| {
+            // Data de inclusão = criação da pasta; atualizar um pet troca os arquivos, não a pasta.
+            let added = e.metadata().and_then(|m| m.created()).ok();
             let dir = e.path();
             let id = e.file_name().to_string_lossy().into_owned();
             let manifest = read_manifest(&dir).unwrap_or_default();
@@ -81,11 +134,106 @@ pub fn discover(dir: &Path) -> Vec<PetInfo> {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| id.clone());
-            PetInfo { id, label, dir }
+            (added, PetInfo { id, label, dir })
         })
         .collect();
-    pets.sort_by_key(|p| p.label.to_lowercase());
-    pets
+    pets.sort_by_key(|(added, p)| (*added, p.label.to_lowercase()));
+    pets.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Vigia a pasta dos pets numa thread (bloqueada no kernel, sem polling) e posta `message`
+/// com um `Box<Vec<String>>`: as pastas de pet que mudaram. Vazio = não dá para saber quais
+/// (o buffer de mudanças estourou), então trate como se todas tivessem mudado.
+pub fn spawn_watch(dir: PathBuf, hwnd: isize, message: u32) {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME,
+        FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
+        FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING, ReadDirectoryChangesW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+    std::thread::spawn(move || {
+        let path = crate::system::wide(&dir.to_string_lossy());
+        loop {
+            // SAFETY: caminho terminado em NUL; BACKUP_SEMANTICS é o que permite abrir uma pasta.
+            let handle = unsafe {
+                CreateFileW(
+                    path.as_ptr(),
+                    FILE_LIST_DIRECTORY,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                // A pasta ainda não existe (ou sumiu): tenta de novo mais tarde.
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                continue;
+            }
+            // u32 para o alinhamento de FILE_NOTIFY_INFORMATION.
+            let mut buf = vec![0u32; 16 * 1024];
+            loop {
+                let mut len = 0u32;
+                // SAFETY: buffer nosso com o tamanho informado; chamada síncrona (sem OVERLAPPED).
+                let ok = unsafe {
+                    ReadDirectoryChangesW(
+                        handle,
+                        buf.as_mut_ptr().cast(),
+                        (buf.len() * 4) as u32,
+                        1,
+                        FILE_NOTIFY_CHANGE_FILE_NAME
+                            | FILE_NOTIFY_CHANGE_DIR_NAME
+                            | FILE_NOTIFY_CHANGE_LAST_WRITE
+                            | FILE_NOTIFY_CHANGE_SIZE,
+                        &mut len,
+                        std::ptr::null_mut(),
+                        None,
+                    )
+                };
+                if ok == 0 {
+                    break;
+                }
+                let mut changed: Vec<String> = Vec::new();
+                let base = buf.as_ptr().cast::<u8>();
+                let mut offset = 0usize;
+                // len 0: o buffer estourou e o kernel descartou a lista; `changed` vai vazio.
+                while (offset as u32) < len {
+                    // SAFETY: o kernel preencheu `len` bytes com entradas encadeadas por NextEntryOffset.
+                    let info = unsafe { &*base.add(offset).cast::<FILE_NOTIFY_INFORMATION>() };
+                    let name = unsafe {
+                        std::slice::from_raw_parts(
+                            info.FileName.as_ptr(),
+                            info.FileNameLength as usize / 2,
+                        )
+                    };
+                    // Só a primeira parte do caminho: a pasta do pet.
+                    let top = String::from_utf16_lossy(name)
+                        .split('\\')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
+                    if !top.is_empty() && !changed.contains(&top) {
+                        changed.push(top);
+                    }
+                    if info.NextEntryOffset == 0 {
+                        break;
+                    }
+                    offset += info.NextEntryOffset as usize;
+                }
+                let ptr = Box::into_raw(Box::new(changed));
+                // SAFETY: a janela retoma a posse do Box; se o post falhar, liberamos aqui.
+                if unsafe { PostMessageW(hwnd as _, message, 0, ptr as isize) } == 0 {
+                    drop(unsafe { Box::from_raw(ptr) });
+                }
+            }
+            // SAFETY: handle aberto acima.
+            unsafe { CloseHandle(handle) };
+        }
+    });
 }
 
 pub fn read_manifest(dir: &Path) -> Result<Manifest, String> {
@@ -163,7 +311,11 @@ pub fn resolve_layout(m: &Manifest, sheet_w: u32, sheet_h: u32) -> Result<Layout
         && sheet_h.is_multiple_of(CODEX_FRAME_H)
         && sheet_h / CODEX_FRAME_H >= CODEX_ROWS;
 
-    let (frame, animations) = match (&m.frame, &m.animations) {
+    let explicit = match &m.animations {
+        Some(Animations::Explicit(specs)) => Some(specs),
+        _ => None,
+    };
+    let (frame, mut animations) = match (&m.frame, explicit) {
         (Some(frame), Some(specs)) => (*frame, from_specs(specs, m.fps)?),
         (Some(frame), None) if frame.width == CODEX_FRAME_W && frame.height == CODEX_FRAME_H => {
             (*frame, codex_animations(m.fps))
@@ -199,6 +351,36 @@ pub fn resolve_layout(m: &Manifest, sheet_w: u32, sheet_h: u32) -> Result<Layout
             )]),
         ),
     };
+
+    if let Some(Animations::Extras(extras)) = &m.animations {
+        for (name, extra) in extras {
+            // Linha desconhecida perde só a animação extra, não o pet.
+            let Some(row) = animations.get(&extra.source_row).map(|a| a.row) else {
+                continue;
+            };
+            let timing = extra.timing_ms.as_deref().unwrap_or(&[]);
+            let fallback = 1000.0 / m.fps.unwrap_or(DEFAULT_FPS);
+            let durations_ms = (0..extra.frame_count as usize)
+                .map(|i| {
+                    let ms = timing.get(i).or(timing.last()).copied().unwrap_or(fallback);
+                    ms.round().max(1.0) as u32
+                })
+                .collect();
+            animations
+                .entry(name.clone())
+                .or_insert(Anim { row, durations_ms });
+        }
+    }
+    let click = m
+        .interactions
+        .click
+        .as_ref()
+        .map(|c| c.animations.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .filter(|name| animations.contains_key(*name))
+        .cloned()
+        .collect();
 
     if frame.width == 0
         || frame.height == 0
@@ -247,6 +429,7 @@ pub fn resolve_layout(m: &Manifest, sheet_w: u32, sheet_h: u32) -> Result<Layout
         frame_h: frame.height,
         default,
         animations,
+        click,
     })
 }
 
@@ -310,6 +493,26 @@ mod tests {
             assert_eq!(layout.animations["review"].row, 8);
             assert_eq!(layout.animations["running"].durations_ms.last(), Some(&220));
         }
+    }
+
+    #[test]
+    fn codex_click_animations_extend_codex_layout() {
+        let m = manifest(
+            r#"{"animations":{
+                  "form-1":{"sourceRow":"waiting","frameCount":8,"timingMs":[190,170]},
+                  "form-x":{"sourceRow":"nao-existe","frameCount":8}},
+                "interactions":{"click":{"animations":["form-1","form-x"],"mode":"cycle"}}}"#,
+        );
+        let layout = resolve_layout(&m, 1536, 1872).unwrap();
+        assert_eq!(layout.animations.len(), 10);
+        assert_eq!(layout.animations["running"].row, 7);
+        // Mesma linha do waiting, com os 8 quadros; timing curto repete o último.
+        assert_eq!(layout.animations["form-1"].row, 6);
+        assert_eq!(
+            layout.animations["form-1"].durations_ms,
+            vec![190, 170, 170, 170, 170, 170, 170, 170]
+        );
+        assert_eq!(layout.click, vec!["form-1"]);
     }
 
     #[test]

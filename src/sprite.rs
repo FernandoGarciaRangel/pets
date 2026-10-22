@@ -17,6 +17,8 @@ pub struct Sprite {
     pub height: u32,
     pub default: String,
     pub anims: HashMap<String, Vec<Frame>>,
+    /// Animações do clique, em ciclo (ver `pets::Layout::click`).
+    pub click: Vec<String>,
 }
 
 /// Filtro de escala: `Fast` enquanto o slider de tamanho se move, `Final` quando ele para.
@@ -33,6 +35,7 @@ pub struct Cells {
     frame_h: u32,
     default: String,
     anims: Vec<(String, Vec<(RgbaImage, u32)>)>,
+    click: Vec<String>,
 }
 
 impl Cells {
@@ -72,6 +75,7 @@ impl Cells {
             frame_h: fh,
             default: layout.default,
             anims,
+            click: layout.click,
         })
     }
 
@@ -126,6 +130,7 @@ impl Cells {
             height,
             default: self.default.clone(),
             anims,
+            click: self.click.clone(),
         }
     }
 }

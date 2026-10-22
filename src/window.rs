@@ -47,11 +47,16 @@ const WM_APP_QUIT: u32 = WM_APP + 4;
 const WM_APP_UPDATE: u32 = WM_APP + 5;
 /// O painel do slider fechou num momento em que o App estava emprestado: termina depois.
 const WM_APP_RESIZE_DONE: u32 = WM_APP + 6;
+/// A pasta dos pets mudou (`pets::spawn_watch`).
+const WM_APP_PETS_CHANGED: u32 = WM_APP + 7;
 const TIMER_FRAME: usize = 1;
 const TIMER_STATE: usize = 2;
 const TIMER_UPDATE: usize = 3;
 const TIMER_RESIZE: usize = 4;
 const TIMER_RESIZE_PREVIEW: usize = 5;
+const TIMER_PETS: usize = 6;
+/// Silêncio na pasta dos pets até recarregar: copiar um pet gera várias mudanças seguidas.
+const PETS_SETTLE_MS: u32 = 500;
 /// O slider manda dezenas de eventos por segundo; aplica o mais recente no máximo a cada ~16 ms.
 const RESIZE_PREVIEW_MS: u32 = 16;
 /// Tempo parado no slider até refazer todas as animações em qualidade final.
@@ -61,7 +66,6 @@ const DRAG_SLOP: i32 = 3;
 
 const ID_TOGGLE: u32 = 10;
 const ID_AUTOSTART: u32 = 11;
-const ID_RELOAD: u32 = 12;
 const ID_INSTALL: u32 = 13;
 const ID_OPEN_DIR: u32 = 14;
 const ID_UPDATE: u32 = 15;
@@ -186,6 +190,9 @@ struct App {
     state: AgentState,
     anim: String,
     frame: usize,
+    /// Animação de clique tocando uma vez, por cima do estado; `click_next` é a próxima do ciclo.
+    click_anim: Option<String>,
+    click_next: usize,
     pos: POINT,
     hovering: bool,
     drag: Option<DragState>,
@@ -205,6 +212,8 @@ struct App {
     resize_anchor: Option<(i32, i32)>,
     /// Os quadros atuais já estão na qualidade final.
     resize_settled: bool,
+    /// Pastas de pet que mudaram desde a última recarga; `None` dentro = não se sabe quais.
+    changed_pets: Vec<Option<String>>,
     updating_pets: bool,
 }
 
@@ -497,6 +506,8 @@ impl App {
             state: AgentState::Idle,
             anim: String::new(),
             frame: 0,
+            click_anim: None,
+            click_next: 0,
             pos: POINT {
                 x: cfg.x.unwrap_or(0),
                 y: cfg.y.unwrap_or(0),
@@ -514,6 +525,7 @@ impl App {
             menu_pet_updates: Vec::new(),
             resize_anchor: None,
             resize_settled: true,
+            changed_pets: Vec::new(),
             updating_pets: false,
             cfg,
         }
@@ -522,6 +534,7 @@ impl App {
     fn start(&mut self) {
         self.tray.add();
         self.load_pet();
+        pets::spawn_watch(self.cfg.pets_dir(), self.hwnd as isize, WM_APP_PETS_CHANGED);
         let saved_ok = self.cfg.x.is_some() && self.cfg.y.is_some() && self.center_on_a_monitor();
         if !saved_ok {
             self.pos = self.default_pos();
@@ -768,6 +781,8 @@ impl App {
         self.error = None;
         self.anim.clear();
         self.frame = 0;
+        self.click_anim = None;
+        self.click_next = 0;
         match chosen {
             None => self.error = Some(format!("Nenhum pet em {}", self.cfg.pets_dir().display())),
             Some(pet) => match Sprite::build(&pet.dir, self.cfg.width) {
@@ -789,6 +804,29 @@ impl App {
         let tip = self.tip();
         self.tray.set_tip(&tip);
         self.apply_visibility();
+    }
+
+    /// A pasta dos pets ficou quieta depois de mudar: refaz a lista do menu e só redesenha o
+    /// pet da tela se a pasta dele mudou (ou sumiu), para não decodificar a folha à toa.
+    fn reload_changed_pets(&mut self) {
+        // SAFETY: timer da nossa janela.
+        unsafe { KillTimer(self.hwnd, TIMER_PETS) };
+        let changed = std::mem::take(&mut self.changed_pets);
+        self.pets = pets::discover(&self.cfg.pets_dir());
+        let current = self.cfg.pet.as_deref();
+        // Nomes de pasta no Windows não diferenciam maiúsculas.
+        let touched = changed.iter().any(|c| match (c, current) {
+            (None, _) => true,
+            (Some(name), Some(cur)) => name.eq_ignore_ascii_case(cur),
+            (Some(_), None) => false,
+        });
+        let reload = touched || self.current_pet().is_none();
+        if cfg!(debug_assertions) {
+            eprintln!("[pets] mudou: {changed:?}; recarrega o pet da tela: {reload}");
+        }
+        if reload {
+            self.load_pet();
+        }
     }
 
     /// Prévia do slider: só a animação atual, com filtro rápido; tudo em qualidade final depois
@@ -1007,9 +1045,29 @@ impl App {
         if len == 0 {
             return;
         }
+        if self.click_anim.is_some() && self.frame + 1 == len {
+            // Animação de clique toca uma vez só; volta para o estado/interação atual.
+            self.click_anim = None;
+            self.refresh_anim();
+            return;
+        }
         self.frame = (self.frame + 1) % len;
         self.render();
         self.schedule_frame();
+    }
+
+    /// Clique sem arrastar: toca a próxima animação de clique do pet, se ele tiver.
+    fn play_click(&mut self) {
+        let Some(sprite) = &self.sprite else { return };
+        if sprite.click.is_empty() {
+            return;
+        }
+        let i = self.click_next % sprite.click.len();
+        self.click_anim = Some(sprite.click[i].clone());
+        self.click_next = i + 1;
+        // Recomeça do primeiro quadro mesmo se o clique repetir a animação que já toca.
+        self.anim.clear();
+        self.refresh_anim();
     }
 
     fn refresh_anim(&mut self) {
@@ -1018,7 +1076,14 @@ impl App {
             .drag
             .as_ref()
             .map_or((false, Drag::None), |d| (true, d.dir));
-        let wanted = animation::select(self.state, dragging, dir, self.hovering);
+        // Arrastar de verdade interrompe a animação de clique.
+        if dir != Drag::None {
+            self.click_anim = None;
+        }
+        let wanted = match &self.click_anim {
+            Some(name) => name.as_str(),
+            None => animation::select(self.state, dragging, dir, self.hovering),
+        };
         let name = if sprite.has(wanted) {
             wanted.to_string()
         } else {
@@ -1116,8 +1181,20 @@ impl App {
                 TIMER_UPDATE => {}
                 TIMER_RESIZE => self.settle_resize(),
                 TIMER_RESIZE_PREVIEW => self.apply_pending_resize(),
+                TIMER_PETS => self.reload_changed_pets(),
                 _ => return Outcome::Default,
             },
+            WM_APP_PETS_CHANGED => {
+                // SAFETY: spawn_watch criou este Box e passou a posse pela mensagem.
+                let changed = unsafe { Box::from_raw(lp as *mut Vec<String>) };
+                if changed.is_empty() {
+                    self.changed_pets.push(None);
+                }
+                self.changed_pets.extend(changed.into_iter().map(Some));
+                // Why: aqui rearmar a cada evento é o objetivo; só recarrega quando a cópia termina.
+                // SAFETY: timer da nossa janela; SetTimer com o mesmo id reinicia a contagem.
+                unsafe { SetTimer(self.hwnd, TIMER_PETS, PETS_SETTLE_MS, None) };
+            }
             WM_APP_HOOK => {
                 // SAFETY: o servidor do pipe criou este Box e passou a posse pela mensagem.
                 let ev = unsafe { Box::from_raw(lp as *mut HookEvent) };
@@ -1168,7 +1245,11 @@ impl App {
             }
             WM_MOUSEMOVE => self.on_mouse_move(),
             WM_LBUTTONUP => {
+                let clicked = self.drag.as_ref().is_some_and(|d| !d.moved);
                 self.end_drag();
+                if clicked {
+                    self.play_click();
+                }
                 // SAFETY: solta a captura; o WM_CAPTURECHANGED reentrante cai no DefWindowProc.
                 unsafe { ReleaseCapture() };
             }
@@ -1311,7 +1392,6 @@ impl App {
             );
             append(menu, MF_SEPARATOR, 0, "");
             append(menu, MF_STRING, ID_OPEN_DIR, "Abrir pasta dos pets");
-            append(menu, MF_STRING, ID_RELOAD, "Recarregar pets");
             // Só vira ação quando falta algum: o install e as atualizações já instalam os hooks.
             let hooks = install::status();
             let mark = |ok: bool| if ok { "✓" } else { "✗" };
@@ -1354,10 +1434,6 @@ impl App {
             ID_TOGGLE => self.set_visible(!self.cfg.visible),
             ID_AUTOSTART => system::set_autostart(!system::autostart_enabled()),
             ID_OPEN_DIR => system::open_folder(&self.cfg.pets_dir()),
-            ID_RELOAD => {
-                self.pets = pets::discover(&self.cfg.pets_dir());
-                self.load_pet();
-            }
             ID_INSTALL => {
                 return match install::install() {
                     Ok(text) => After::Message(text, false),
