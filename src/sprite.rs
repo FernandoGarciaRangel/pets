@@ -23,7 +23,7 @@ pub struct Sprite {
     pub icon: Vec<u8>,
 }
 
-/// Filtro de escala: `Fast` durante o ajuste com a roda do mouse, `Final` quando ele termina.
+/// Filtro de escala: `Fast` enquanto o slider de tamanho se move, `Final` quando ele para.
 #[derive(Clone, Copy)]
 pub enum Quality {
     Fast,
@@ -31,7 +31,7 @@ pub enum Quality {
 }
 
 /// Quadros recortados no tamanho original da folha. Guardados só enquanto o usuário
-/// redimensiona, para não decodificar a spritesheet a cada passo da roda.
+/// redimensiona, para não decodificar a spritesheet a cada passo do slider.
 pub struct Cells {
     frame_w: u32,
     frame_h: u32,

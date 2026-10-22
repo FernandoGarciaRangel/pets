@@ -225,6 +225,11 @@ pub fn parse_petdex(body: &[u8]) -> Result<Vec<Remote>, String> {
 /// Árvore do repositório awesome-codex-pet: `pets/<id>--<autor>/spritesheet.webp`.
 pub fn parse_awesome_tree(body: &[u8]) -> Result<Vec<Remote>, String> {
     let v: Value = serde_json::from_slice(body).map_err(|e| format!("aimcp.info: {e}"))?;
+    // Why: com `truncated` a lista vem incompleta; tratar como completa marcaria pets como
+    // "fora do catálogo" para sempre.
+    if v["truncated"].as_bool() == Some(true) {
+        return Err("aimcp.info: a árvore do GitHub veio truncada".into());
+    }
     let tree = v["tree"]
         .as_array()
         .ok_or("aimcp.info: árvore sem entradas")?;
@@ -302,8 +307,6 @@ fn lookup(catalogs: &mut Catalogs, source: Source, key: &str) -> Result<Option<R
     }
 }
 
-/// Procura a entrada cujo spritesheet é idêntico ao local. `seen` vira true se o nome existe em
-/// algum catálogo (para distinguir "diferente" de "não está em nenhum").
 /// Resultado de procurar um pet nos três catálogos.
 struct Identified {
     remote: Option<Remote>,
@@ -343,7 +346,10 @@ fn identify(catalogs: &mut Catalogs, id: &str, sheet: &[u8]) -> Identified {
                         found.remote = Some(remote);
                         return found;
                     }
-                    Ok(r) if r.status == 200 || r.status == 404 => {}
+                    // Tamanho diferente ou arquivo sumiu: não é este.
+                    Ok(r) if (r.status == 200 && r.content_length.is_some()) || r.status == 404 => {
+                    }
+                    // Sem Content-Length (CDN com chunked/compressão), erro HTTP ou de rede.
                     _ => found.failed = true,
                 }
             }
@@ -487,7 +493,11 @@ pub fn check(pets: &[PetInfo]) -> Vec<(PetInfo, Status, Option<Remote>)> {
         // Relê antes de gravar: um `apply` pode ter registrado versão nova enquanto a rede rodava.
         let _guard = STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut latest = State::load();
-        latest.0.extend(changes);
+        for (id, after) in changes {
+            if latest.0.get(&id) == state.0.get(&id) {
+                latest.0.insert(id, after);
+            }
+        }
         latest.save();
     }
     out
@@ -793,6 +803,12 @@ mod tests {
 
         forget();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn truncated_github_tree_is_an_error() {
+        assert!(parse_awesome_tree(br#"{"truncated":true,"tree":[]}"#).is_err());
+        assert!(parse_awesome_tree(br#"{"truncated":false,"tree":[]}"#).is_ok());
     }
 
     #[test]

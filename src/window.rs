@@ -54,7 +54,7 @@ const TIMER_RESIZE: usize = 4;
 const TIMER_RESIZE_PREVIEW: usize = 5;
 /// O slider manda dezenas de eventos por segundo; aplica o mais recente no máximo a cada ~16 ms.
 const RESIZE_PREVIEW_MS: u32 = 16;
-/// Depois de parar de rolar a roda: refaz os quadros na qualidade final e solta os `Cells`.
+/// Tempo parado no slider até refazer todas as animações em qualidade final.
 const RESIZE_SETTLE_MS: u32 = 600;
 /// Deslocamento mínimo (px) para um clique virar arrasto.
 const DRAG_SLOP: i32 = 3;
@@ -197,6 +197,14 @@ struct App {
     preview_armed: bool,
     pet_updates: Vec<PetUpdate>,
     notified_pets: Vec<String>,
+    /// As atualizações de pets como estavam quando o menu foi montado: os ids dos itens são
+    /// posições nesta lista, que não muda se uma checagem chegar com o menu aberto.
+    menu_pet_updates: Vec<PetUpdate>,
+    /// Ponto fixo do redimensionamento (2×centro x, base y), para o pet não andar de lado com
+    /// o arredondamento de meio pixel a cada passo do slider.
+    resize_anchor: Option<(i32, i32)>,
+    /// Os quadros atuais já estão na qualidade final.
+    resize_settled: bool,
     updating_pets: bool,
 }
 
@@ -503,6 +511,9 @@ impl App {
             preview_armed: false,
             pet_updates: Vec::new(),
             notified_pets: Vec::new(),
+            menu_pet_updates: Vec::new(),
+            resize_anchor: None,
+            resize_settled: true,
             updating_pets: false,
             cfg,
         }
@@ -534,18 +545,7 @@ impl App {
         };
     }
 
-    /// Aplica numa thread as atualizações de pets: todas (`None`) ou a de índice `only`.
-    fn start_pet_updates(&mut self, only: Option<usize>) {
-        let chosen = self
-            .pet_updates
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| only.is_none_or(|o| o == *i))
-            .map(|(_, u)| u.clone())
-            .collect();
-        self.apply_pet_updates(chosen);
-    }
-
+    /// Aplica numa thread as atualizações de pets passadas.
     fn apply_pet_updates(&mut self, updates: Vec<PetUpdate>) {
         if self.updating_pets {
             return;
@@ -641,6 +641,10 @@ impl App {
             },
             UpdateMsg::PetsChecked { updates, manual } => {
                 self.pet_updates = updates;
+                // Why: sem isto, um pet já avisado e atualizado nunca mais notificaria versão nova.
+                let pending = &self.pet_updates;
+                self.notified_pets
+                    .retain(|id| pending.iter().any(|u| &u.id == id));
                 if self.pet_updates.is_empty() {
                     return Outcome::Handled(0);
                 }
@@ -816,13 +820,12 @@ impl App {
             return;
         }
         if self.resize_cells.is_none() {
-            let dir = self
-                .cfg
-                .pet
-                .as_ref()
-                .and_then(|id| self.pets.iter().find(|p| &p.id == id))
-                .map(|p| p.dir.clone());
-            self.resize_cells = dir.and_then(|d| Cells::load(&d).ok());
+            self.resize_cells = self.current_pet().and_then(|p| Cells::load(&p.dir).ok());
+        }
+        if self.resize_anchor.is_none()
+            && let Some((w, h)) = self.size()
+        {
+            self.resize_anchor = Some((2 * self.pos.x + w, self.pos.y + h));
         }
         let Some(cells) = &self.resize_cells else {
             return;
@@ -830,6 +833,7 @@ impl App {
         self.cfg.width = target;
         let sprite = cells.scale_only(target, &self.anim, Quality::Fast);
         self.install_resized(sprite);
+        self.resize_settled = false;
         // SAFETY: timer da nossa janela; SetTimer com o mesmo id reinicia a contagem.
         unsafe { SetTimer(self.hwnd, TIMER_RESIZE, RESIZE_SETTLE_MS, None) };
     }
@@ -839,9 +843,14 @@ impl App {
     fn settle_resize(&mut self) {
         // SAFETY: timer da nossa janela.
         unsafe { KillTimer(self.hwnd, TIMER_RESIZE) };
-        if let Some(cells) = &self.resize_cells {
+        if !self.resize_settled
+            && let Some(cells) = &self.resize_cells
+        {
             let sprite = cells.scale(self.cfg.width, Quality::Final);
             self.install_resized(sprite);
+            self.resize_settled = true;
+            // A prévia só tinha a animação visível: se o estado mudou no meio, troca agora.
+            self.refresh_anim();
         }
         self.cfg.save();
     }
@@ -851,6 +860,13 @@ impl App {
         self.apply_pending_resize();
         self.settle_resize();
         self.resize_cells = None;
+        self.resize_anchor = None;
+    }
+
+    /// O pet configurado (o `load_pet` grava em `cfg.pet` o que conseguiu abrir).
+    fn current_pet(&self) -> Option<&PetInfo> {
+        let id = self.cfg.pet.as_deref()?;
+        self.pets.iter().find(|p| p.id == id)
     }
 
     /// Troca os quadros mantendo animação, quadro atual e os pés do pet no lugar.
@@ -858,10 +874,18 @@ impl App {
         let old_size = self.size();
         self.dib = Dib::new(sprite.width, sprite.height);
         self.sprite = Some(sprite);
-        if let (Some((ow, oh)), Some((nw, nh))) = (old_size, self.size()) {
-            self.pos.x += (ow - nw) / 2;
-            self.pos.y += oh - nh;
-            self.move_to(self.pos);
+        match (self.resize_anchor, old_size, self.size()) {
+            (Some((center2, bottom)), _, Some((nw, nh))) => {
+                self.pos.x = (center2 - nw).div_euclid(2);
+                self.pos.y = bottom - nh;
+                self.move_to(self.pos);
+            }
+            (None, Some((ow, oh)), Some((nw, nh))) => {
+                self.pos.x += (ow - nw) / 2;
+                self.pos.y += oh - nh;
+                self.move_to(self.pos);
+            }
+            _ => {}
         }
         if self.frame >= self.frames_len() {
             self.frame = 0;
@@ -1075,6 +1099,8 @@ impl App {
                 self.cfg.x = Some(self.pos.x);
                 self.cfg.y = Some(self.pos.y);
                 self.cfg.save();
+                // Arrastado com o painel do slider aberto: o próximo passo ancora no lugar novo.
+                self.resize_anchor = None;
             }
             self.refresh_anim();
         }
@@ -1174,7 +1200,8 @@ impl App {
         Outcome::Handled(0)
     }
 
-    fn build_menu(&self) -> HMENU {
+    fn build_menu(&mut self) -> HMENU {
+        self.menu_pet_updates = self.pet_updates.clone();
         // SAFETY: menus criados aqui; o pai é destruído por show_menu e leva os submenus junto.
         unsafe {
             let menu = CreatePopupMenu();
@@ -1201,7 +1228,7 @@ impl App {
                 append(menu, MF_STRING | MF_GRAYED, 0, "Atualizando pets…");
             } else if !self.pet_updates.is_empty() {
                 let pets_menu = CreatePopupMenu();
-                for (i, u) in self.pet_updates.iter().enumerate() {
+                for (i, u) in self.menu_pet_updates.iter().enumerate() {
                     append(
                         pets_menu,
                         MF_STRING,
@@ -1339,11 +1366,12 @@ impl App {
                 };
             }
             ID_UPDATE => self.start_download(),
-            ID_PET_UPDATE_ALL => self.start_pet_updates(None),
-            id if (ID_PET_UPDATE_BASE..ID_PET_UPDATE_BASE + self.pet_updates.len() as u32)
+            ID_PET_UPDATE_ALL => self.apply_pet_updates(self.menu_pet_updates.clone()),
+            id if (ID_PET_UPDATE_BASE..ID_PET_UPDATE_BASE + self.menu_pet_updates.len() as u32)
                 .contains(&id) =>
             {
-                self.start_pet_updates(Some((id - ID_PET_UPDATE_BASE) as usize))
+                let chosen = self.menu_pet_updates[(id - ID_PET_UPDATE_BASE) as usize].clone();
+                self.apply_pet_updates(vec![chosen]);
             }
             ID_CHECK_UPDATE => spawn_check(self.hwnd, true, Duration::ZERO, self.pets.clone()),
             ID_AUTO_UPDATE => {
