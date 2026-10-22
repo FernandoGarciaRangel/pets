@@ -37,7 +37,9 @@ pub fn parse(agent: &str, input: &[u8]) -> Option<HookEvent> {
 
 fn send(bytes: &[u8]) {
     use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
-    for _ in 0..3 {
+    // Até ~2 s com o pipe ocupado (o servidor dá no máximo 250 ms a cada cliente). Com o app
+    // livre o WaitNamedPipe volta na hora; app fechado nem chega aqui.
+    for _ in 0..10 {
         match std::fs::OpenOptions::new().write(true).open(PIPE_NAME) {
             Ok(mut pipe) => {
                 let _ = pipe.write_all(bytes);

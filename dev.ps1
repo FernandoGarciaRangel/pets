@@ -22,8 +22,10 @@ if ($Install) {
     $psi.StandardOutputEncoding = [Text.Encoding]::UTF8
     $psi.StandardErrorEncoding = [Text.Encoding]::UTF8
     $p = [System.Diagnostics.Process]::Start($psi)
+    # stderr em paralelo: ler um depois do outro trava se o processo encher o buffer do segundo.
+    $stderr = $p.StandardError.ReadToEndAsync()
     $p.StandardOutput.ReadToEnd()
-    $p.StandardError.ReadToEnd()
+    $stderr.Result
     $p.WaitForExit()
     exit $p.ExitCode
 }

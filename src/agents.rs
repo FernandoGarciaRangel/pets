@@ -120,50 +120,123 @@ impl Sessions {
 
 /// Thread que aceita conexões no pipe e entrega cada evento à janela via `PostMessageW`.
 pub fn spawn_pipe_server(hwnd: isize, message: u32) {
-    use std::io::Read;
-    use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::Foundation::{
-        ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE,
+        CloseHandle, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, GetLastError, HANDLE,
+        INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
     };
-    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OVERLAPPED, PIPE_ACCESS_INBOUND, ReadFile,
+    };
+    use windows_sys::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
         PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
+    use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
     use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+    /// O hook escreve uma linha e fecha na hora; um cliente que segura a conexão além disso
+    /// travaria todos os eventos seguintes.
+    const READ_DEADLINE: Duration = Duration::from_millis(250);
+    const MAX_EVENT_BYTES: usize = 64 * 1024;
+
+    /// Lê até o cliente fechar, `MAX_EVENT_BYTES` ou `READ_DEADLINE`, o que vier antes.
+    ///
+    /// SAFETY: `pipe` é uma instância conectada aberta com FILE_FLAG_OVERLAPPED e `event` é um
+    /// evento de reset manual; os dois continuam abertos durante a chamada.
+    unsafe fn read_event(pipe: HANDLE, event: HANDLE) -> Vec<u8> {
+        let deadline = Instant::now() + READ_DEADLINE;
+        let mut buf = vec![0u8; MAX_EVENT_BYTES];
+        let mut len = 0usize;
+        while len < buf.len() {
+            let mut ov: OVERLAPPED = unsafe { std::mem::zeroed() };
+            ov.hEvent = event;
+            let mut n = 0u32;
+            let started = unsafe {
+                ReadFile(
+                    pipe,
+                    buf[len..].as_mut_ptr(),
+                    (buf.len() - len) as u32,
+                    std::ptr::null_mut(),
+                    &mut ov,
+                )
+            };
+            if started == 0 {
+                if unsafe { GetLastError() } != ERROR_IO_PENDING {
+                    break; // ERROR_BROKEN_PIPE: o cliente terminou de escrever e fechou.
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if unsafe { WaitForSingleObject(event, left.as_millis() as u32) } != WAIT_OBJECT_0 {
+                    unsafe {
+                        CancelIo(pipe);
+                        // Espera o cancelamento: `ov` e `buf` não podem sair de cena antes.
+                        GetOverlappedResult(pipe, &ov, &mut n, 1);
+                    }
+                    break;
+                }
+            }
+            if unsafe { GetOverlappedResult(pipe, &ov, &mut n, 1) } == 0 || n == 0 {
+                break;
+            }
+            len += n as usize;
+        }
+        buf.truncate(len);
+        buf
+    }
 
     std::thread::spawn(move || {
         let name = crate::system::wide(PIPE_NAME);
-        loop {
+        let create = || loop {
             // SAFETY: nome terminado em NUL; segurança padrão (só o usuário atual e admins escrevem).
             let handle = unsafe {
                 CreateNamedPipeW(
                     name.as_ptr(),
-                    PIPE_ACCESS_INBOUND,
+                    PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED,
                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                     PIPE_UNLIMITED_INSTANCES,
                     0,
-                    64 * 1024,
+                    MAX_EVENT_BYTES as u32,
                     0,
                     std::ptr::null(),
                 )
             };
-            if handle == INVALID_HANDLE_VALUE {
-                std::thread::sleep(Duration::from_secs(1));
-                continue;
+            if handle != INVALID_HANDLE_VALUE {
+                return handle;
             }
+            std::thread::sleep(Duration::from_secs(1));
+        };
+        // SAFETY: evento de reset manual, sem nome; vive enquanto a thread vive.
+        let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+        if event.is_null() {
+            return;
+        }
+        let mut next = create();
+        loop {
+            let handle = next;
+            // SAFETY: handle aberto com FILE_FLAG_OVERLAPPED, então ConnectNamedPipe exige um
+            // OVERLAPPED; esperar a conexão não tem prazo (é o app ocioso esperando hooks).
             let connected = unsafe {
-                ConnectNamedPipe(handle, std::ptr::null_mut()) != 0
-                    || GetLastError() == ERROR_PIPE_CONNECTED
+                let mut ov: OVERLAPPED = std::mem::zeroed();
+                ov.hEvent = event;
+                let mut n = 0u32;
+                ConnectNamedPipe(handle, &mut ov) != 0
+                    || match GetLastError() {
+                        // NO_DATA: o cliente já escreveu e fechou; o que ele mandou ainda está lá.
+                        ERROR_PIPE_CONNECTED | ERROR_NO_DATA => true,
+                        ERROR_IO_PENDING => GetOverlappedResult(handle, &ov, &mut n, 1) != 0,
+                        _ => false,
+                    }
             };
-            // SAFETY: o File passa a ser dono do handle e o fecha ao sair do escopo.
-            let mut pipe = unsafe { std::fs::File::from_raw_handle(handle) };
-            if !connected {
-                continue;
-            }
-            let mut buf = Vec::new();
-            let _ = (&mut pipe).take(64 * 1024).read_to_end(&mut buf);
-            drop(pipe);
+            // Why: a próxima instância nasce antes de ler esta. Sem isso, entre um evento e outro
+            // o pipe não existia, e o hook seguinte achava que o app estava fechado e desistia.
+            next = create();
+            // SAFETY: instância conectada acima, aberta com FILE_FLAG_OVERLAPPED; fechada logo depois.
+            let buf = if connected {
+                unsafe { read_event(handle, event) }
+            } else {
+                Vec::new()
+            };
+            unsafe { CloseHandle(handle) };
 
             for line in String::from_utf8_lossy(&buf).lines() {
                 let Ok(ev) = serde_json::from_str::<HookEvent>(line) else {

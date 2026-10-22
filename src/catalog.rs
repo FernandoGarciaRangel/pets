@@ -557,7 +557,10 @@ pub fn apply(pet_dir: &Path, update: &PetUpdate) -> Result<(), String> {
     std::fs::write(staging.join(pets::MANIFEST_FILE), &manifest_text).map_err(|e| e.to_string())?;
     std::fs::write(staging.join(SHEET_FILE), &sheet).map_err(|e| e.to_string())?;
     // Decodifica e valida o layout antes de tocar no pet de verdade.
-    crate::sprite::Cells::load(&staging).map_err(|e| format!("a versão nova não abre: {e}"))?;
+    if let Err(e) = crate::sprite::Cells::load(&staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(format!("a versão nova não abre: {e}"));
+    }
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -573,6 +576,7 @@ pub fn apply(pet_dir: &Path, update: &PetUpdate) -> Result<(), String> {
                 .map_err(|e| format!("backup falhou: {e}"))?;
         }
     }
+    prune_backups(&app_dir.join("backups"), &update.id);
 
     for name in [SHEET_FILE, pets::MANIFEST_FILE] {
         let tmp = pet_dir.join(format!("{name}.tmp-pets"));
@@ -618,6 +622,30 @@ pub fn report(pets: &[PetInfo]) -> String {
 }
 
 /// `pets.exe update-pets`: aplica todas as atualizações disponíveis.
+/// Backups guardados por pet; os mais antigos saem, senão cada atualização deixa uma cópia a mais.
+const KEEP_BACKUPS: usize = 3;
+
+/// Apaga os backups `<id>-<timestamp>` além dos `KEEP_BACKUPS` mais novos.
+fn prune_backups(dir: &Path, id: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{id}-");
+    let mut stamps: Vec<(u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            // Só `<id>-<dígitos>`: `goku-2-…` é de outro pet, não do `goku`.
+            let stamp = name.strip_prefix(&prefix)?.parse().ok()?;
+            Some((stamp, e.path()))
+        })
+        .collect();
+    stamps.sort_unstable_by_key(|(stamp, _)| std::cmp::Reverse(*stamp));
+    for (_, path) in stamps.into_iter().skip(KEEP_BACKUPS) {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
 pub fn update_all(pets: &[PetInfo]) -> Result<String, String> {
     let found = updates(pets);
     if found.is_empty() {
@@ -645,6 +673,24 @@ pub fn update_all(pets: &[PetInfo]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune_keeps_the_newest_backups_of_that_pet_only() {
+        let dir = std::env::temp_dir().join(format!("pets-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for name in ["goku-1", "goku-2", "goku-3", "goku-4", "goku-2-9", "goku-x"] {
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+        }
+        prune_backups(&dir, "goku");
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["goku-2", "goku-2-9", "goku-3", "goku-4", "goku-x"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parses_codex_pets_share_data() {

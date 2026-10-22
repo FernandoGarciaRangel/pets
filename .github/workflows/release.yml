@@ -12,9 +12,13 @@ jobs:
   release:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # Actions fixadas pelo SHA: este job tem permissão de escrita no repositório.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Conferir versão da tag com o Cargo.toml
         shell: pwsh
@@ -24,6 +28,9 @@ jobs:
             throw "Tag $env:GITHUB_REF_NAME não bate com a versão $version do Cargo.toml"
           }
 
+      # As mesmas checagens do CI: uma tag pode apontar para um commit que nunca passou por ele.
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --release
       - run: cargo build --release
 

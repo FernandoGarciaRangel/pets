@@ -28,7 +28,7 @@ pub struct Manifest {
     #[serde(default, deserialize_with = "animations")]
     pub animations: Option<Animations>,
     #[serde(default)]
-    pub interactions: Interactions,
+    pub interactions: Option<Interactions>,
 }
 
 #[derive(Debug)]
@@ -67,14 +67,18 @@ where
     let Some(raw) = Option::<BTreeMap<String, serde_json::Value>>::deserialize(d)? else {
         return Ok(None);
     };
-    let extras = raw.values().any(|v| v.get("sourceRow").is_some());
+    if raw.values().any(|v| v.get("sourceRow").is_some()) {
+        // Extras são enfeite: a que não faz sentido sai sozinha, sem derrubar o pet.
+        let extras = raw
+            .into_iter()
+            .filter_map(|(name, v)| Some((name, serde_json::from_value(v).ok()?)))
+            .collect();
+        return Ok(Some(Animations::Extras(extras)));
+    }
     let parsed = serde_json::Value::Object(raw.into_iter().collect());
-    let animations = if extras {
-        Animations::Extras(serde_json::from_value(parsed).map_err(serde::de::Error::custom)?)
-    } else {
-        Animations::Explicit(serde_json::from_value(parsed).map_err(serde::de::Error::custom)?)
-    };
-    Ok(Some(animations))
+    serde_json::from_value(parsed)
+        .map(|specs| Some(Animations::Explicit(specs)))
+        .map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -202,13 +206,16 @@ pub fn spawn_watch(dir: PathBuf, hwnd: isize, message: u32) {
                 let mut offset = 0usize;
                 // len 0: o buffer estourou e o kernel descartou a lista; `changed` vai vazio.
                 while (offset as u32) < len {
-                    // SAFETY: o kernel preencheu `len` bytes com entradas encadeadas por NextEntryOffset.
-                    let info = unsafe { &*base.add(offset).cast::<FILE_NOTIFY_INFORMATION>() };
-                    let name = unsafe {
-                        std::slice::from_raw_parts(
-                            info.FileName.as_ptr(),
-                            info.FileNameLength as usize / 2,
-                        )
+                    // SAFETY: o kernel preencheu `len` bytes com entradas encadeadas por
+                    // NextEntryOffset. O nome passa do `[u16; 1]` da struct, então ele é lido por
+                    // ponteiro cru, não por referência à struct.
+                    let entry = unsafe { base.add(offset).cast::<FILE_NOTIFY_INFORMATION>() };
+                    let (next, name) = unsafe {
+                        let name = std::slice::from_raw_parts(
+                            std::ptr::addr_of!((*entry).FileName).cast::<u16>(),
+                            (*entry).FileNameLength as usize / 2,
+                        );
+                        ((*entry).NextEntryOffset, name)
                     };
                     // Só a primeira parte do caminho: a pasta do pet.
                     let top = String::from_utf16_lossy(name)
@@ -219,10 +226,10 @@ pub fn spawn_watch(dir: PathBuf, hwnd: isize, message: u32) {
                     if !top.is_empty() && !changed.contains(&top) {
                         changed.push(top);
                     }
-                    if info.NextEntryOffset == 0 {
+                    if next == 0 {
                         break;
                     }
-                    offset += info.NextEntryOffset as usize;
+                    offset += next as usize;
                 }
                 let ptr = Box::into_raw(Box::new(changed));
                 // SAFETY: a janela retoma a posse do Box; se o post falhar, liberamos aqui.
@@ -232,6 +239,9 @@ pub fn spawn_watch(dir: PathBuf, hwnd: isize, message: u32) {
             }
             // SAFETY: handle aberto acima.
             unsafe { CloseHandle(handle) };
+            // Why: só chega aqui se a vigia falhou (pasta apagada, ou numa unidade de rede/WSL
+            // que não avisa mudanças); reabrir na hora giraria a CPU em 100%.
+            std::thread::sleep(std::time::Duration::from_secs(5));
         }
     });
 }
@@ -353,11 +363,15 @@ pub fn resolve_layout(m: &Manifest, sheet_w: u32, sheet_h: u32) -> Result<Layout
     };
 
     if let Some(Animations::Extras(extras)) = &m.animations {
+        let columns = sheet_w.checked_div(frame.width).unwrap_or(0);
         for (name, extra) in extras {
-            // Linha desconhecida perde só a animação extra, não o pet.
+            // Linha desconhecida ou quadros fora da folha perdem só a animação extra, não o pet.
             let Some(row) = animations.get(&extra.source_row).map(|a| a.row) else {
                 continue;
             };
+            if extra.frame_count == 0 || extra.frame_count > columns {
+                continue;
+            }
             let timing = extra.timing_ms.as_deref().unwrap_or(&[]);
             let fallback = 1000.0 / m.fps.unwrap_or(DEFAULT_FPS);
             let durations_ms = (0..extra.frame_count as usize)
@@ -373,8 +387,8 @@ pub fn resolve_layout(m: &Manifest, sheet_w: u32, sheet_h: u32) -> Result<Layout
     }
     let click = m
         .interactions
-        .click
         .as_ref()
+        .and_then(|i| i.click.as_ref())
         .map(|c| c.animations.as_slice())
         .unwrap_or(&[])
         .iter()
@@ -500,8 +514,11 @@ mod tests {
         let m = manifest(
             r#"{"animations":{
                   "form-1":{"sourceRow":"waiting","frameCount":8,"timingMs":[190,170]},
-                  "form-x":{"sourceRow":"nao-existe","frameCount":8}},
-                "interactions":{"click":{"animations":["form-1","form-x"],"mode":"cycle"}}}"#,
+                  "form-x":{"sourceRow":"nao-existe","frameCount":8},
+                  "form-0":{"sourceRow":"waiting","frameCount":0},
+                  "form-9":{"sourceRow":"waiting","frameCount":9},
+                  "quebrada":{"row":3}},
+                "interactions":{"click":{"animations":["form-1","form-x","form-0","form-9"],"mode":"cycle"}}}"#,
         );
         let layout = resolve_layout(&m, 1536, 1872).unwrap();
         assert_eq!(layout.animations.len(), 10);
@@ -513,6 +530,9 @@ mod tests {
             vec![190, 170, 170, 170, 170, 170, 170, 170]
         );
         assert_eq!(layout.click, vec!["form-1"]);
+
+        let m = manifest(r#"{"interactions":null}"#);
+        assert!(resolve_layout(&m, 1536, 1872).unwrap().click.is_empty());
     }
 
     #[test]

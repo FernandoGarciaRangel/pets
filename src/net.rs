@@ -3,6 +3,9 @@
 use std::ptr::{null, null_mut};
 
 const MAX_DOWNLOAD: usize = 32 * 1024 * 1024;
+/// Prazo do download inteiro. Os timeouts do WinHTTP valem por operação: um servidor que manda
+/// um pouco a cada 29 s seguraria a thread (e o "atualizando…" do menu) para sempre.
+const DOWNLOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 pub struct Response {
     pub status: u32,
@@ -114,8 +117,15 @@ pub fn request(method: &str, url: &str) -> Result<Response, String> {
 
         let mut body = Vec::new();
         if method != "HEAD" {
+            if content_length.is_some_and(|n| n > MAX_DOWNLOAD as u64) {
+                return Err(format!("download maior que o limite em {url}"));
+            }
+            let deadline = std::time::Instant::now() + DOWNLOAD_DEADLINE;
             let mut chunk = vec![0u8; 64 * 1024];
             loop {
+                if std::time::Instant::now() > deadline {
+                    return Err(format!("download lento demais em {url}"));
+                }
                 let mut read = 0u32;
                 if WinHttpReadData(
                     request.0,
@@ -133,6 +143,15 @@ pub fn request(method: &str, url: &str) -> Result<Response, String> {
                 if body.len() > MAX_DOWNLOAD {
                     return Err(format!("download maior que o limite em {url}"));
                 }
+            }
+            // Conexão que cai no meio termina como fim normal do corpo; só o tamanho denuncia.
+            if let Some(expected) = content_length
+                && body.len() as u64 != expected
+            {
+                return Err(format!(
+                    "download incompleto em {url} ({} de {expected} bytes)",
+                    body.len()
+                ));
             }
         }
         Ok(Response {

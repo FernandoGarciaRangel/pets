@@ -23,11 +23,11 @@ fn main() {
         Some("hook") => hook::run(args.get(1).map(String::as_str).unwrap_or("unknown")),
         // O app dispara `install --from-update` sem console: erro vira caixa de mensagem.
         Some("install") if args.iter().any(|a| a == "--from-update") => {
-            if let Err(e) = install::install_app() {
+            if let Err(e) = install::install_app(true) {
                 system::message_box(&format!("A atualização falhou: {e}"), true);
             }
         }
-        Some("install") => cli(install::install_app()),
+        Some("install") => cli(install::install_app(false)),
         Some("check-update") => cli(match update::check() {
             update::CheckResult::Available(r) => Ok(format!(
                 "v{} disponível (atual v{})",

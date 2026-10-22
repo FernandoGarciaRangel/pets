@@ -80,8 +80,25 @@ impl Config {
 }
 
 pub fn default_pets_dir() -> PathBuf {
+    codex_home().join("pets")
+}
+
+/// Pasta de config do Codex: `CODEX_HOME`, como o próprio Codex, ou `~/.codex`.
+pub fn codex_home() -> PathBuf {
+    agent_home("CODEX_HOME", ".codex")
+}
+
+/// Pasta de config do Claude Code: `CLAUDE_CONFIG_DIR`, como o próprio Claude, ou `~/.claude`.
+pub fn claude_home() -> PathBuf {
+    agent_home("CLAUDE_CONFIG_DIR", ".claude")
+}
+
+fn agent_home(var: &str, default: &str) -> PathBuf {
+    if let Some(dir) = std::env::var_os(var).filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
     let home = std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".codex").join("pets")
+    home.join(default)
 }

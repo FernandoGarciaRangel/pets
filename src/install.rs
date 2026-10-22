@@ -37,25 +37,23 @@ struct Target {
 }
 
 fn targets() -> Vec<Target> {
-    let home = std::env::var_os("USERPROFILE")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    use crate::config::{claude_home, codex_home};
     vec![
         Target {
             agent: "claude",
-            path: home.join(".claude").join("settings.json"),
+            path: claude_home().join("settings.json"),
             events: CLAUDE_EVENTS,
         },
         Target {
             agent: "codex",
-            path: home.join(".codex").join("hooks.json"),
+            path: codex_home().join("hooks.json"),
             events: CODEX_EVENTS,
         },
     ]
 }
 
 pub fn install() -> Result<String, String> {
-    install_hooks_for(&hook_exe()?)
+    install_hooks_for(&hook_exe()?, false)
 }
 
 /// Para onde os hooks apontam: a cópia instalada, se existir; senão este exe.
@@ -77,8 +75,9 @@ pub fn installed_exe() -> PathBuf {
 }
 
 /// `pets.exe install`: copia este exe para `installed_exe()`, aponta hooks e autostart para lá
-/// e reinicia o pet a partir da cópia instalada.
-pub fn install_app() -> Result<String, String> {
+/// e reinicia o pet a partir da cópia instalada. Numa atualização (`from_update`) só refaz os
+/// hooks dos agentes que já os tinham, para não desfazer um `uninstall-hooks`.
+pub fn install_app(from_update: bool) -> Result<String, String> {
     let src = std::env::current_exe().map_err(|e| e.to_string())?;
     let dest = installed_exe();
     if same_file(&src, &dest) {
@@ -88,23 +87,15 @@ pub fn install_app() -> Result<String, String> {
     }
     let was_running = crate::window::quit_running_instance();
 
-    let dir = dest.parent().ok_or("caminho de instalação inválido")?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let old = dest.with_extension("exe.old");
-    let _ = std::fs::remove_file(&old);
-    // Why: o Windows deixa renomear um exe em uso (um hook rodando agora), mas não sobrescrever.
-    if dest.exists() {
-        std::fs::rename(&dest, &old)
-            .map_err(|e| format!("não consegui tirar o exe antigo do lugar: {e}"))?;
+    // Why: daqui em diante o pet antigo já foi fechado; qualquer falha ainda deixa um rodando.
+    if let Err(e) = replace_exe(&src, &dest) {
+        if was_running {
+            let _ = spawn_detached(&dest, &[]);
+        }
+        return Err(e);
     }
-    if let Err(e) = std::fs::copy(&src, &dest) {
-        let _ = std::fs::rename(&old, &dest);
-        return Err(format!("não consegui copiar para {}: {e}", dest.display()));
-    }
-    let _ = std::fs::remove_file(&old);
-
     let mut lines = vec![format!("copiado para {}", dest.display())];
-    lines.push(install_hooks_for(&dest)?);
+    let hooks = install_hooks_for(&dest, from_update);
     if crate::system::autostart_enabled() {
         crate::system::set_autostart_exe(Some(&dest));
         lines.push("iniciar com o Windows agora aponta para a cópia instalada".into());
@@ -116,7 +107,29 @@ pub fn install_app() -> Result<String, String> {
     } else {
         "pet iniciado".into()
     });
+    match hooks {
+        Ok(line) => lines.push(line),
+        Err(e) => return Err(format!("o pet foi instalado, mas os hooks não: {e}")),
+    }
     Ok(lines.join("\n"))
+}
+
+fn replace_exe(src: &Path, dest: &Path) -> Result<(), String> {
+    let dir = dest.parent().ok_or("caminho de instalação inválido")?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let old = dest.with_extension("exe.old");
+    let _ = std::fs::remove_file(&old);
+    // Why: o Windows deixa renomear um exe em uso (um hook rodando agora), mas não sobrescrever.
+    if dest.exists() {
+        std::fs::rename(dest, &old)
+            .map_err(|e| format!("não consegui tirar o exe antigo do lugar: {e}"))?;
+    }
+    if let Err(e) = std::fs::copy(src, dest) {
+        let _ = std::fs::rename(&old, dest);
+        return Err(format!("não consegui copiar para {}: {e}", dest.display()));
+    }
+    let _ = std::fs::remove_file(&old);
+    Ok(())
 }
 
 /// Menu Iniciar a cada instalação (mantém o caminho certo); área de trabalho só uma vez, para
@@ -184,9 +197,13 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn install_hooks_for(exe: &Path) -> Result<String, String> {
+/// `only_installed`: pula o agente que não tem hooks do pets (o usuário tirou ou nunca quis).
+fn install_hooks_for(exe: &Path, only_installed: bool) -> Result<String, String> {
     let mut lines = Vec::new();
     for t in targets() {
+        if only_installed && !contains_ours(&std::fs::read_to_string(&t.path).unwrap_or_default()) {
+            continue;
+        }
         let cmd = hook_command(exe, t.agent);
         let changed = update_file(&t.path, t.events, Some(&cmd))?;
         lines.push(format!(
@@ -239,6 +256,10 @@ fn update_file(path: &Path, events: &[(&str, bool)], cmd: Option<&str>) -> Resul
         }
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
+    // Sem nada nosso para tirar, não regrava (o merge reformata o arquivo inteiro).
+    if cmd.is_none() && !contains_ours(&text) {
+        return Ok(false);
+    }
     let merged = merge(&text, events, cmd).map_err(|e| format!("{}: {e}", path.display()))?;
     if merged == text {
         return Ok(false);
@@ -246,7 +267,11 @@ fn update_file(path: &Path, events: &[(&str, bool)], cmd: Option<&str>) -> Resul
     if path.exists() {
         let mut backup = path.as_os_str().to_owned();
         backup.push(".bak-pets");
-        std::fs::copy(path, &backup).map_err(|e| format!("backup de {}: {e}", path.display()))?;
+        // Why: o backup é do arquivo de antes do pets; regravar a cada install perderia o original.
+        if !Path::new(&backup).exists() {
+            std::fs::copy(path, &backup)
+                .map_err(|e| format!("backup de {}: {e}", path.display()))?;
+        }
     } else if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
@@ -258,12 +283,44 @@ fn update_file(path: &Path, events: &[(&str, bool)], cmd: Option<&str>) -> Resul
 }
 
 fn is_ours(group: &Value) -> bool {
-    group["hooks"].as_array().is_some_and(|hooks| {
-        hooks.iter().any(|h| {
-            h["command"].as_str().is_some_and(|c| {
-                let c = c.to_ascii_lowercase();
-                c.contains("pets.exe") && c.contains(" hook ")
-            })
+    group["hooks"]
+        .as_array()
+        .is_some_and(|hooks| hooks.iter().any(is_our_hook))
+}
+
+/// O formato exato de `hook_command`, com qualquer pasta: `<...>/pets.exe hook <agente>`, com
+/// ou sem aspas. `codex-pets.exe hook` ou um script que só cita pets.exe não são nossos.
+fn is_our_hook(hook: &Value) -> bool {
+    let Some(cmd) = hook["command"].as_str() else {
+        return false;
+    };
+    let cmd = cmd.trim();
+    let (exe, rest) = match cmd.strip_prefix('"') {
+        Some(quoted) => match quoted.split_once('"') {
+            Some(parts) => parts,
+            None => return false,
+        },
+        None => match cmd.to_ascii_lowercase().find(" hook ") {
+            Some(i) => cmd.split_at(i),
+            None => return false,
+        },
+    };
+    let file = exe.rsplit(['/', '\\']).next().unwrap_or_default();
+    let mut args = rest.split_whitespace();
+    file.eq_ignore_ascii_case("pets.exe")
+        && args.next().is_some_and(|a| a.eq_ignore_ascii_case("hook"))
+        && args.next().is_some()
+        && args.next().is_none()
+}
+
+/// Algum hook do pets no arquivo, apontando para qualquer exe.
+fn contains_ours(text: &str) -> bool {
+    serde_json::from_str::<Value>(text).is_ok_and(|root| {
+        root["hooks"].as_object().is_some_and(|hooks| {
+            hooks
+                .values()
+                .filter_map(Value::as_array)
+                .any(|groups| groups.iter().any(is_ours))
         })
     })
 }
@@ -332,7 +389,15 @@ pub fn merge(text: &str, events: &[(&str, bool)], cmd: Option<&str>) -> Result<S
             return true;
         };
         let before = arr.len();
-        arr.retain(|g| !is_ours(g));
+        // Tira só o nosso hook de dentro de cada grupo: um grupo pode ter também o de outro app.
+        arr.retain_mut(|g| {
+            let Some(hooks) = g.get_mut("hooks").and_then(Value::as_array_mut) else {
+                return true;
+            };
+            let had = hooks.len();
+            hooks.retain(|h| !is_our_hook(h));
+            !(hooks.is_empty() && had > 0)
+        });
         // Só some com o evento se fomos nós que o esvaziamos.
         !(arr.is_empty() && before > 0)
     });
@@ -375,6 +440,45 @@ mod tests {
   }
 }"#;
     const CMD: &str = "C:/repos/Pets-Prj/target/release/pets.exe hook claude";
+
+    #[test]
+    fn recognizes_only_our_exact_hook_command() {
+        let ours = |c: &str| is_our_hook(&json!({ "command": c }));
+        assert!(ours(CMD));
+        assert!(ours(r#""C:/Program Files/Pets/pets.exe" hook codex"#));
+        assert!(ours(
+            r"C:\Users\x\AppData\Local\Programs\Pets\PETS.EXE hook claude"
+        ));
+        assert!(!ours("C:/x/codex-pets.exe hook claude"));
+        assert!(!ours("C:/x/pets.exe hook"));
+        assert!(!ours("C:/x/pets.exe hook claude --extra"));
+        assert!(!ours("node run.js pets.exe hook claude"));
+    }
+
+    #[test]
+    fn removes_our_hook_but_keeps_a_shared_group() {
+        let shared = format!(
+            r#"{{"hooks":{{"Stop":[{{"hooks":[
+                {{"type":"command","command":"{CMD}"}},
+                {{"type":"command","command":"orca-agent-hook.exe claude"}}]}}]}}}}"#
+        );
+        let out: Value =
+            serde_json::from_str(&merge(&shared, CLAUDE_EVENTS, None).unwrap()).unwrap();
+        let hooks = out["hooks"]["Stop"][0]["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0]["command"], "orca-agent-hook.exe claude");
+    }
+
+    #[test]
+    fn update_only_touches_agents_that_had_our_hooks() {
+        assert!(!contains_ours(ORCA));
+        assert!(!contains_ours(""));
+        assert!(!contains_ours("{ quebrado"));
+        // Aponta para outro exe e ainda conta: a atualização deve corrigir o caminho.
+        assert!(contains_ours(
+            &merge(ORCA, CLAUDE_EVENTS, Some(CMD)).unwrap()
+        ));
+    }
 
     #[test]
     fn install_keeps_other_hooks_and_is_idempotent() {

@@ -207,6 +207,8 @@ struct App {
     /// As atualizações de pets como estavam quando o menu foi montado: os ids dos itens são
     /// posições nesta lista, que não muda se uma checagem chegar com o menu aberto.
     menu_pet_updates: Vec<PetUpdate>,
+    /// Ids dos pets na ordem do menu aberto: a lista pode mudar (vigia da pasta) com ele aberto.
+    menu_pets: Vec<String>,
     /// Ponto fixo do redimensionamento (2×centro x, base y), para o pet não andar de lado com
     /// o arredondamento de meio pixel a cada passo do slider.
     resize_anchor: Option<(i32, i32)>,
@@ -357,9 +359,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 0
             }
-            None if msg == WM_APP_HOOK => {
-                // Não deu para entregar ao App (reentrada): só libera o evento.
-                drop(Box::from_raw(lp as *mut HookEvent));
+            // Reentrada: o App está emprestado mais acima na pilha. Repõe na fila em vez de
+            // descartar; perder um hook deixava o pet preso num estado velho.
+            None if msg == WM_APP_HOOK || msg == WM_APP_PETS_CHANGED => {
+                if PostMessageW(hwnd, msg, wp, lp) == 0 {
+                    if msg == WM_APP_HOOK {
+                        drop(Box::from_raw(lp as *mut HookEvent));
+                    } else {
+                        drop(Box::from_raw(lp as *mut Vec<String>));
+                    }
+                }
                 0
             }
             None if msg == WM_APP_UPDATE => {
@@ -523,6 +532,7 @@ impl App {
             pet_updates: Vec::new(),
             notified_pets: Vec::new(),
             menu_pet_updates: Vec::new(),
+            menu_pets: Vec::new(),
             resize_anchor: None,
             resize_settled: true,
             changed_pets: Vec::new(),
@@ -682,21 +692,13 @@ impl App {
             UpdateMsg::PetsApplied(results) => {
                 self.updating_pets = false;
                 let mut failures = Vec::new();
-                let mut reload = false;
                 for (id, label, result) in results {
                     match result {
-                        Ok(()) => {
-                            self.pet_updates.retain(|u| u.id != id);
-                            reload |= self.cfg.pet.as_deref() == Some(id.as_str());
-                        }
+                        Ok(()) => self.pet_updates.retain(|u| u.id != id),
                         Err(e) => failures.push(format!("• {label}: {e}")),
                     }
                 }
-                // Nome e descrição podem ter mudado.
-                self.pets = pets::discover(&self.cfg.pets_dir());
-                if reload {
-                    self.load_pet();
-                }
+                // A lista e o pet da tela o vigia da pasta recarrega (`reload_changed_pets`).
                 if !failures.is_empty() {
                     return Outcome::Message(
                         format!("Alguns pets não atualizaram:\n\n{}", failures.join("\n")),
@@ -826,6 +828,10 @@ impl App {
         }
         if reload {
             self.load_pet();
+            // Sem isso o pet só sumia da tela, e o motivo ficava escondido na dica da bandeja.
+            if let Some(error) = &self.error {
+                self.tray.notify("Pet não abriu", error);
+            }
         }
     }
 
@@ -1029,7 +1035,8 @@ impl App {
             .sprite
             .as_ref()
             .map(|s| s.frames(&self.anim))
-            .filter(|frames| frames.len() > 1 && self.cfg.visible)
+            // Animação de clique de um quadro também precisa do timer, para conseguir terminar.
+            .filter(|frames| (frames.len() > 1 || self.click_anim.is_some()) && self.cfg.visible)
             .and_then(|frames| frames.get(self.frame).map(|f| f.duration_ms));
         // SAFETY: timers da nossa janela; SetTimer com o mesmo id substitui o anterior.
         unsafe {
@@ -1282,6 +1289,7 @@ impl App {
 
     fn build_menu(&mut self) -> HMENU {
         self.menu_pet_updates = self.pet_updates.clone();
+        self.menu_pets = self.pets.iter().map(|p| p.id.clone()).collect();
         // SAFETY: menus criados aqui; o pai é destruído por show_menu e leva os submenus junto.
         unsafe {
             let menu = CreatePopupMenu();
@@ -1458,8 +1466,8 @@ impl App {
                 self.tray.remove();
                 return After::Quit;
             }
-            id if (ID_PET_BASE..ID_PET_BASE + self.pets.len() as u32).contains(&id) => {
-                self.cfg.pet = Some(self.pets[(id - ID_PET_BASE) as usize].id.clone());
+            id if (ID_PET_BASE..ID_PET_BASE + self.menu_pets.len() as u32).contains(&id) => {
+                self.cfg.pet = Some(self.menu_pets[(id - ID_PET_BASE) as usize].clone());
                 self.load_pet();
                 self.cfg.save();
             }
