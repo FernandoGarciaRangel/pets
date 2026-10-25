@@ -1,6 +1,7 @@
 // Em release não há console: o pet vive na bandeja, e o modo `hook` roda sem piscar janela.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod activity;
 mod agents;
 mod animation;
 mod builtin;

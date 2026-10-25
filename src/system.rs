@@ -1,6 +1,6 @@
 //! Pequenos utilitários Win32: strings UTF-16, console, início com o Windows, abrir pasta, aviso.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegDeleteValueW,
@@ -177,6 +177,98 @@ pub fn confirm(text: &str) -> bool {
             MB_YESNO | MB_ICONQUESTION,
         ) == IDYES
     }
+}
+
+/// Vigia `dir` numa thread bloqueada no kernel (`ReadDirectoryChangesW`, sem polling) e chama
+/// `on_change` a cada lote com (ação `FILE_ACTION_*`, caminho relativo). `None` = o buffer
+/// estourou e o kernel descartou a lista, então não dá para saber o que mudou.
+pub fn watch_dir(
+    dir: PathBuf,
+    subtree: bool,
+    filter: u32,
+    mut on_change: impl FnMut(Option<Vec<(u32, String)>>) + Send + 'static,
+) {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_INFORMATION,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadDirectoryChangesW,
+    };
+
+    std::thread::spawn(move || {
+        let path = wide(&dir.to_string_lossy());
+        loop {
+            // SAFETY: caminho terminado em NUL; BACKUP_SEMANTICS é o que permite abrir uma pasta.
+            let handle = unsafe {
+                CreateFileW(
+                    path.as_ptr(),
+                    FILE_LIST_DIRECTORY,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                // A pasta ainda não existe (ou sumiu): tenta de novo mais tarde.
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                continue;
+            }
+            // u32 para o alinhamento de FILE_NOTIFY_INFORMATION.
+            let mut buf = vec![0u32; 16 * 1024];
+            loop {
+                let mut len = 0u32;
+                // SAFETY: buffer nosso com o tamanho informado; chamada síncrona (sem OVERLAPPED).
+                let ok = unsafe {
+                    ReadDirectoryChangesW(
+                        handle,
+                        buf.as_mut_ptr().cast(),
+                        (buf.len() * 4) as u32,
+                        subtree as i32,
+                        filter,
+                        &mut len,
+                        std::ptr::null_mut(),
+                        None,
+                    )
+                };
+                if ok == 0 {
+                    break;
+                }
+                // len 0: o buffer estourou e o kernel descartou a lista.
+                if len == 0 {
+                    on_change(None);
+                    continue;
+                }
+                let mut entries = Vec::new();
+                let base = buf.as_ptr().cast::<u8>();
+                let mut offset = 0usize;
+                while (offset as u32) < len {
+                    // SAFETY: o kernel preencheu `len` bytes com entradas encadeadas por
+                    // NextEntryOffset. O nome passa do `[u16; 1]` da struct, então ele é lido por
+                    // ponteiro cru, não por referência à struct.
+                    let entry = unsafe { base.add(offset).cast::<FILE_NOTIFY_INFORMATION>() };
+                    let (next, action, name) = unsafe {
+                        let name = std::slice::from_raw_parts(
+                            std::ptr::addr_of!((*entry).FileName).cast::<u16>(),
+                            (*entry).FileNameLength as usize / 2,
+                        );
+                        ((*entry).NextEntryOffset, (*entry).Action, name)
+                    };
+                    entries.push((action, String::from_utf16_lossy(name)));
+                    if next == 0 {
+                        break;
+                    }
+                    offset += next as usize;
+                }
+                on_change(Some(entries));
+            }
+            // SAFETY: handle aberto acima.
+            unsafe { CloseHandle(handle) };
+            // Why: só chega aqui se a vigia falhou (pasta apagada, ou numa unidade de rede/WSL
+            // que não avisa mudanças); reabrir na hora giraria a CPU em 100%.
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    });
 }
 
 #[cfg(test)]

@@ -149,99 +149,30 @@ pub fn discover(dir: &Path) -> Vec<PetInfo> {
 /// com um `Box<Vec<String>>`: as pastas de pet que mudaram. Vazio = não dá para saber quais
 /// (o buffer de mudanças estourou), então trate como se todas tivessem mudado.
 pub fn spawn_watch(dir: PathBuf, hwnd: isize, message: u32) {
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_DIR_NAME,
-        FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE,
-        FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        OPEN_EXISTING, ReadDirectoryChangesW,
+        FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+        FILE_NOTIFY_CHANGE_SIZE,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-    std::thread::spawn(move || {
-        let path = crate::system::wide(&dir.to_string_lossy());
-        loop {
-            // SAFETY: caminho terminado em NUL; BACKUP_SEMANTICS é o que permite abrir uma pasta.
-            let handle = unsafe {
-                CreateFileW(
-                    path.as_ptr(),
-                    FILE_LIST_DIRECTORY,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    std::ptr::null(),
-                    OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS,
-                    std::ptr::null_mut(),
-                )
-            };
-            if handle == INVALID_HANDLE_VALUE {
-                // A pasta ainda não existe (ou sumiu): tenta de novo mais tarde.
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                continue;
+    let filter = FILE_NOTIFY_CHANGE_FILE_NAME
+        | FILE_NOTIFY_CHANGE_DIR_NAME
+        | FILE_NOTIFY_CHANGE_LAST_WRITE
+        | FILE_NOTIFY_CHANGE_SIZE;
+    crate::system::watch_dir(dir, true, filter, move |entries| {
+        // `None` (buffer estourado) deixa `changed` vazio.
+        let mut changed: Vec<String> = Vec::new();
+        for (_, name) in entries.into_iter().flatten() {
+            // Só a primeira parte do caminho: a pasta do pet.
+            let top = name.split('\\').next().unwrap_or_default().to_string();
+            if !top.is_empty() && !changed.contains(&top) {
+                changed.push(top);
             }
-            // u32 para o alinhamento de FILE_NOTIFY_INFORMATION.
-            let mut buf = vec![0u32; 16 * 1024];
-            loop {
-                let mut len = 0u32;
-                // SAFETY: buffer nosso com o tamanho informado; chamada síncrona (sem OVERLAPPED).
-                let ok = unsafe {
-                    ReadDirectoryChangesW(
-                        handle,
-                        buf.as_mut_ptr().cast(),
-                        (buf.len() * 4) as u32,
-                        1,
-                        FILE_NOTIFY_CHANGE_FILE_NAME
-                            | FILE_NOTIFY_CHANGE_DIR_NAME
-                            | FILE_NOTIFY_CHANGE_LAST_WRITE
-                            | FILE_NOTIFY_CHANGE_SIZE,
-                        &mut len,
-                        std::ptr::null_mut(),
-                        None,
-                    )
-                };
-                if ok == 0 {
-                    break;
-                }
-                let mut changed: Vec<String> = Vec::new();
-                let base = buf.as_ptr().cast::<u8>();
-                let mut offset = 0usize;
-                // len 0: o buffer estourou e o kernel descartou a lista; `changed` vai vazio.
-                while (offset as u32) < len {
-                    // SAFETY: o kernel preencheu `len` bytes com entradas encadeadas por
-                    // NextEntryOffset. O nome passa do `[u16; 1]` da struct, então ele é lido por
-                    // ponteiro cru, não por referência à struct.
-                    let entry = unsafe { base.add(offset).cast::<FILE_NOTIFY_INFORMATION>() };
-                    let (next, name) = unsafe {
-                        let name = std::slice::from_raw_parts(
-                            std::ptr::addr_of!((*entry).FileName).cast::<u16>(),
-                            (*entry).FileNameLength as usize / 2,
-                        );
-                        ((*entry).NextEntryOffset, name)
-                    };
-                    // Só a primeira parte do caminho: a pasta do pet.
-                    let top = String::from_utf16_lossy(name)
-                        .split('\\')
-                        .next()
-                        .unwrap_or_default()
-                        .to_string();
-                    if !top.is_empty() && !changed.contains(&top) {
-                        changed.push(top);
-                    }
-                    if next == 0 {
-                        break;
-                    }
-                    offset += next as usize;
-                }
-                let ptr = Box::into_raw(Box::new(changed));
-                // SAFETY: a janela retoma a posse do Box; se o post falhar, liberamos aqui.
-                if unsafe { PostMessageW(hwnd as _, message, 0, ptr as isize) } == 0 {
-                    drop(unsafe { Box::from_raw(ptr) });
-                }
-            }
-            // SAFETY: handle aberto acima.
-            unsafe { CloseHandle(handle) };
-            // Why: só chega aqui se a vigia falhou (pasta apagada, ou numa unidade de rede/WSL
-            // que não avisa mudanças); reabrir na hora giraria a CPU em 100%.
-            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+        let ptr = Box::into_raw(Box::new(changed));
+        // SAFETY: a janela retoma a posse do Box; se o post falhar, liberamos aqui.
+        if unsafe { PostMessageW(hwnd as _, message, 0, ptr as isize) } == 0 {
+            drop(unsafe { Box::from_raw(ptr) });
         }
     });
 }

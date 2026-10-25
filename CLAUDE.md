@@ -36,11 +36,19 @@ Data flow:
 - The pipe server creates the **next** instance before reading the current one, so the pipe name never disappears between events (a client that found no pipe would assume the app was closed and drop the event). Instances are overlapped: each client gets at most 250 ms (`READ_DEADLINE`) to send its line, so a client that connects and never closes cannot stall the others. Test with ~20 concurrent `target/debug/pets.exe hook claude` processes, with and without a client holding the pipe open.
 - `Sessions`, keyed by (agent, session_id), maps hook events to `AgentState`. Each state expires on its own: review lasts 60 s, failed 5 s, and sessions go stale after 10 or 30 min.
 - `aggregate` picks the most urgent state across sessions: waiting > working > failed > done > idle.
-- `animation::select` applies interaction on top of that state: dragging → running-left/right, hover → jumping.
-- Click animations (`window::play_click`): a click without dragging plays the pet's next `click` animation **once** (`click_anim`, which `refresh_anim` prefers over everything but a real drag), then `next_frame` drops it and the state/hover animation returns. A real drag interrupts it.
+- `Mood::of` combines that state with what the pet notices on its own (`Activity`, see below): agent waiting > meeting > other agent states > away > coding > idle. Meeting and away are `frozen`: first idle frame, no frame timer.
+- `animation::select` applies interaction on top of the mood: dragging → running-left/right, hover → jumping. Hover or drag also unfreezes.
+- One-shot animations (`window::play_once`, `once_anim`): a click without dragging plays the pet's next `click` animation, a finished download plays `jumping`, coming back from away plays `waving`. `refresh_anim` prefers it over everything but a real drag, then `next_frame` drops it and the mood/hover animation returns. A real drag interrupts it.
+
+Activity (`activity.rs`, the "Perceber sozinho" submenu, `config.detect_*`, all on by default):
+- **Meeting:** a thread blocks on `RegNotifyChangeKeyValue` over `HKCU\...\CapabilityAccessManager\ConsentStore\microphone` (packaged apps + `NonPackaged`); an app with `LastUsedTimeStart` set and `LastUsedTimeStop == 0` is using the mic → `WM_APP_MIC` (wParam 1/0). Games with voice chat count too.
+- **Coding:** `SetWinEventHook(EVENT_SYSTEM_FOREGROUND)` out of context only posts `WM_APP_FOREGROUND`; the handler reads the foreground exe and checks `CODING_APPS` (editors, IDEs, terminals).
+- **Download:** `system::watch_dir` on the Downloads folder (`User Shell Folders`, it can be moved); browsers download to a temp name (`.crdownload`, `.part`) and rename at the end, so only a rename to a non-partial name counts → `WM_APP_DOWNLOAD`.
+- **Away:** `GetLastInputInfo`; `TIMER_AWAY` fires once when `AWAY_AFTER` (5 min) would expire, and every second only while away, to wave as soon as you return.
+- The watchers always run (they sit blocked); the menu only masks them in `App::activity()`. The three messages carry no Box and are re-posted on reentrancy like `WM_APP_HOOK`.
 
 Pets folder watcher:
-- `pets::spawn_watch` blocks on `ReadDirectoryChangesW` (no polling) and posts the changed top-level pet folders as `WM_APP_PETS_CHANGED` (`Box<Vec<String>>`; empty = buffer overflowed, treat everything as changed). After a failure it waits 5 s before reopening, so a folder without change notifications (network, WSL) does not spin the CPU.
+- `pets::spawn_watch` blocks on `ReadDirectoryChangesW` through `system::watch_dir` (no polling) and posts the changed top-level pet folders as `WM_APP_PETS_CHANGED` (`Box<Vec<String>>`; empty = buffer overflowed, treat everything as changed). After a failure it waits 5 s before reopening, so a folder without change notifications (network, WSL) does not spin the CPU.
 - The window debounces with `TIMER_PETS` (500 ms of silence, re-armed on purpose) and `reload_changed_pets` rediscovers the list; the on-screen pet is rebuilt only if its own folder changed or vanished. A load error shows a tray notification. There is no manual "Recarregar pets" item, and catalog updates also rely on the watcher.
 - `discover` orders pets by folder creation date (inclusion date); updating a pet swaps files, not the folder, so it keeps its place. Menu ids are positions in `menu_pets`, a snapshot taken in `build_menu`, because the list can change while the menu is open.
 

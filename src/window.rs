@@ -1,8 +1,9 @@
 //! A janela do pet: Win32 layered, sempre no topo, livre por todos os monitores.
 //! Redesenha só na troca de quadro (`SetTimer` com a duração do quadro), então fica parada em repouso.
 
+use crate::activity;
 use crate::agents::{self, HookEvent, Sessions};
-use crate::animation::{self, AgentState, Drag};
+use crate::animation::{self, Activity, AgentState, Drag, Mood};
 use crate::builtin;
 use crate::catalog::{self, PetUpdate};
 use crate::config::{Config, MAX_WIDTH, MIN_WIDTH};
@@ -49,12 +50,19 @@ const WM_APP_UPDATE: u32 = WM_APP + 5;
 const WM_APP_RESIZE_DONE: u32 = WM_APP + 6;
 /// A pasta dos pets mudou (`pets::spawn_watch`).
 const WM_APP_PETS_CHANGED: u32 = WM_APP + 7;
+/// Algum app começou (wParam 1) ou parou (0) de usar o microfone (`activity::spawn_mic_watch`).
+const WM_APP_MIC: u32 = WM_APP + 8;
+/// Outra janela veio para a frente (`activity::watch_foreground`).
+const WM_APP_FOREGROUND: u32 = WM_APP + 9;
+/// Um download terminou (`activity::spawn_download_watch`).
+const WM_APP_DOWNLOAD: u32 = WM_APP + 10;
 const TIMER_FRAME: usize = 1;
 const TIMER_STATE: usize = 2;
 const TIMER_UPDATE: usize = 3;
 const TIMER_RESIZE: usize = 4;
 const TIMER_RESIZE_PREVIEW: usize = 5;
 const TIMER_PETS: usize = 6;
+const TIMER_AWAY: usize = 7;
 /// Silêncio na pasta dos pets até recarregar: copiar um pet gera várias mudanças seguidas.
 const PETS_SETTLE_MS: u32 = 500;
 /// O slider manda dezenas de eventos por segundo; aplica o mais recente no máximo a cada ~16 ms.
@@ -76,6 +84,10 @@ const ID_PET_UPDATE_BASE: u32 = 3000;
 const ID_QUIT: u32 = 99;
 const ID_PET_BASE: u32 = 1000;
 const ID_SIZE_PANEL: u32 = 18;
+const ID_DETECT_MEETING: u32 = 20;
+const ID_DETECT_AWAY: u32 = 21;
+const ID_DETECT_DOWNLOADS: u32 = 22;
+const ID_DETECT_APPS: u32 = 23;
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -187,11 +199,16 @@ struct App {
     tray: Tray,
     taskbar_created: u32,
     sessions: Sessions,
-    state: AgentState,
+    /// O que o pet percebe sozinho, como chegou; `activity()` aplica o que o menu deixou ligado.
+    activity: Activity,
+    mood: Mood,
     anim: String,
     frame: usize,
-    /// Animação de clique tocando uma vez, por cima do estado; `click_next` é a próxima do ciclo.
-    click_anim: Option<String>,
+    /// Parado no primeiro quadro (`Mood::frozen`), sem timer de quadros.
+    frozen: bool,
+    /// Animação tocando uma vez por cima do estado (clique, download, aceno na volta);
+    /// `click_next` é a próxima animação de clique do ciclo.
+    once_anim: Option<String>,
     click_next: usize,
     pos: POINT,
     hovering: bool,
@@ -361,11 +378,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             // Reentrada: o App está emprestado mais acima na pilha. Repõe na fila em vez de
             // descartar; perder um hook deixava o pet preso num estado velho.
-            None if msg == WM_APP_HOOK || msg == WM_APP_PETS_CHANGED => {
+            None if matches!(
+                msg,
+                WM_APP_HOOK
+                    | WM_APP_PETS_CHANGED
+                    | WM_APP_MIC
+                    | WM_APP_FOREGROUND
+                    | WM_APP_DOWNLOAD
+            ) =>
+            {
                 if PostMessageW(hwnd, msg, wp, lp) == 0 {
                     if msg == WM_APP_HOOK {
                         drop(Box::from_raw(lp as *mut HookEvent));
-                    } else {
+                    } else if msg == WM_APP_PETS_CHANGED {
                         drop(Box::from_raw(lp as *mut Vec<String>));
                     }
                 }
@@ -512,10 +537,12 @@ impl App {
             // SAFETY: string terminada em NUL.
             taskbar_created: unsafe { RegisterWindowMessageW(taskbar.as_ptr()) },
             sessions: Sessions::default(),
-            state: AgentState::Idle,
+            activity: Activity::default(),
+            mood: Mood::Agent(AgentState::Idle),
             anim: String::new(),
             frame: 0,
-            click_anim: None,
+            frozen: false,
+            once_anim: None,
             click_next: 0,
             pos: POINT {
                 x: cfg.x.unwrap_or(0),
@@ -545,6 +572,13 @@ impl App {
         self.tray.add();
         self.load_pet();
         pets::spawn_watch(self.cfg.pets_dir(), self.hwnd as isize, WM_APP_PETS_CHANGED);
+        // As vigias rodam sempre (ficam bloqueadas, sem custo); o menu só decide se o pet liga.
+        let hwnd = self.hwnd as isize;
+        activity::spawn_mic_watch(hwnd, WM_APP_MIC);
+        activity::spawn_download_watch(hwnd, WM_APP_DOWNLOAD);
+        activity::watch_foreground(hwnd, WM_APP_FOREGROUND);
+        self.on_foreground();
+        self.check_away();
         let saved_ok = self.cfg.x.is_some() && self.cfg.y.is_some() && self.center_on_a_monitor();
         if !saved_ok {
             self.pos = self.default_pos();
@@ -783,7 +817,8 @@ impl App {
         self.error = None;
         self.anim.clear();
         self.frame = 0;
-        self.click_anim = None;
+        self.frozen = false;
+        self.once_anim = None;
         self.click_next = 0;
         match chosen {
             None => self.error = Some(format!("Nenhum pet em {}", self.cfg.pets_dir().display())),
@@ -940,7 +975,7 @@ impl App {
         match &self.error {
             Some(e) => format!("Pets — {e}"),
             None => {
-                let mut tip = format!("{} — {}", self.current_label(), self.state.label());
+                let mut tip = format!("{} — {}", self.current_label(), self.mood.label());
                 if self.updating {
                     tip.push_str(" · atualizando…");
                 } else if let Some(release) = &self.update {
@@ -1035,8 +1070,10 @@ impl App {
             .sprite
             .as_ref()
             .map(|s| s.frames(&self.anim))
-            // Animação de clique de um quadro também precisa do timer, para conseguir terminar.
-            .filter(|frames| (frames.len() > 1 || self.click_anim.is_some()) && self.cfg.visible)
+            // Animação de um quadro tocando uma vez também precisa do timer, para conseguir terminar.
+            .filter(|frames| {
+                (frames.len() > 1 || self.once_anim.is_some()) && !self.frozen && self.cfg.visible
+            })
             .and_then(|frames| frames.get(self.frame).map(|f| f.duration_ms));
         // SAFETY: timers da nossa janela; SetTimer com o mesmo id substitui o anterior.
         unsafe {
@@ -1052,9 +1089,9 @@ impl App {
         if len == 0 {
             return;
         }
-        if self.click_anim.is_some() && self.frame + 1 == len {
-            // Animação de clique toca uma vez só; volta para o estado/interação atual.
-            self.click_anim = None;
+        if self.once_anim.is_some() && self.frame + 1 == len {
+            // Toca uma vez só; volta para o estado/interação atual.
+            self.once_anim = None;
             self.refresh_anim();
             return;
         }
@@ -1070,9 +1107,17 @@ impl App {
             return;
         }
         let i = self.click_next % sprite.click.len();
-        self.click_anim = Some(sprite.click[i].clone());
+        let name = sprite.click[i].clone();
         self.click_next = i + 1;
-        // Recomeça do primeiro quadro mesmo se o clique repetir a animação que já toca.
+        self.play_once(name);
+    }
+
+    fn play_once(&mut self, name: String) {
+        if !self.sprite.as_ref().is_some_and(|s| s.has(&name)) {
+            return;
+        }
+        self.once_anim = Some(name);
+        // Recomeça do primeiro quadro mesmo se repetir a animação que já toca.
         self.anim.clear();
         self.refresh_anim();
     }
@@ -1083,21 +1128,24 @@ impl App {
             .drag
             .as_ref()
             .map_or((false, Drag::None), |d| (true, d.dir));
-        // Arrastar de verdade interrompe a animação de clique.
+        // Arrastar de verdade interrompe a animação que tocava uma vez.
         if dir != Drag::None {
-            self.click_anim = None;
+            self.once_anim = None;
         }
-        let wanted = match &self.click_anim {
+        let wanted = match &self.once_anim {
             Some(name) => name.as_str(),
-            None => animation::select(self.state, dragging, dir, self.hovering),
+            None => animation::select(self.mood, dragging, dir, self.hovering),
         };
         let name = if sprite.has(wanted) {
             wanted.to_string()
         } else {
             sprite.default.clone()
         };
-        if name != self.anim {
+        // Mexer no pet (hover, arrasto, clique) o acorda mesmo parado.
+        let frozen = self.mood.frozen() && self.once_anim.is_none() && !dragging && !self.hovering;
+        if name != self.anim || frozen != self.frozen {
             self.anim = name;
+            self.frozen = frozen;
             self.frame = 0;
             self.render();
             self.schedule_frame();
@@ -1106,9 +1154,12 @@ impl App {
 
     fn refresh_state(&mut self) {
         let now = Instant::now();
-        let state = self.sessions.aggregate(now);
-        if state != self.state {
-            self.state = state;
+        let mood = Mood::of(self.sessions.aggregate(now), self.activity());
+        if mood != self.mood {
+            if cfg!(debug_assertions) {
+                eprintln!("[atividade] {}", mood.label());
+            }
+            self.mood = mood;
             self.refresh_anim();
             let tip = self.tip();
             self.tray.set_tip(&tip);
@@ -1124,6 +1175,53 @@ impl App {
                 ),
                 None => KillTimer(self.hwnd, TIMER_STATE) as usize,
             };
+        }
+    }
+
+    /// O que o pet percebe, só com o que está ligado no menu.
+    fn activity(&self) -> Activity {
+        Activity {
+            meeting: self.cfg.detect_meeting && self.activity.meeting,
+            away: self.cfg.detect_away && self.activity.away,
+            coding: self.cfg.detect_apps && self.activity.coding,
+        }
+    }
+
+    fn on_foreground(&mut self) {
+        let exe = activity::foreground_exe();
+        if cfg!(debug_assertions) {
+            eprintln!("[atividade] em primeiro plano: {exe:?}");
+        }
+        self.activity.coding = exe.is_some_and(|e| activity::is_coding_app(&e));
+        self.refresh_state();
+    }
+
+    /// Sem timer de verdade enquanto você está no computador: só reconfere quando os 5 min
+    /// sem mexer venceriam. Fora, confere a cada segundo para acenar assim que você voltar.
+    fn check_away(&mut self) {
+        if !self.cfg.detect_away {
+            self.activity.away = false;
+            // SAFETY: timer da nossa janela.
+            unsafe { KillTimer(self.hwnd, TIMER_AWAY) };
+            self.refresh_state();
+            return;
+        }
+        let idle = activity::idle_for();
+        let away = idle >= activity::AWAY_AFTER;
+        let wait = if away {
+            activity::AWAY_POLL
+        } else {
+            activity::AWAY_AFTER - idle
+        };
+        // SAFETY: timer da nossa janela; SetTimer com o mesmo id substitui o anterior.
+        unsafe { SetTimer(self.hwnd, TIMER_AWAY, wait.as_millis() as u32 + 50, None) };
+        if away != self.activity.away {
+            let was = self.mood;
+            self.activity.away = away;
+            self.refresh_state();
+            if was == Mood::Away && !self.mood.frozen() {
+                self.play_once("waving".into());
+            }
         }
     }
 
@@ -1189,6 +1287,7 @@ impl App {
                 TIMER_RESIZE => self.settle_resize(),
                 TIMER_RESIZE_PREVIEW => self.apply_pending_resize(),
                 TIMER_PETS => self.reload_changed_pets(),
+                TIMER_AWAY => self.check_away(),
                 _ => return Outcome::Default,
             },
             WM_APP_PETS_CHANGED => {
@@ -1207,6 +1306,24 @@ impl App {
                 let ev = unsafe { Box::from_raw(lp as *mut HookEvent) };
                 self.sessions.apply(&ev, Instant::now());
                 self.refresh_state();
+            }
+            WM_APP_MIC => {
+                self.activity.meeting = wp != 0;
+                if cfg!(debug_assertions) {
+                    eprintln!("[atividade] microfone em uso: {}", wp != 0);
+                }
+                self.refresh_state();
+            }
+            WM_APP_FOREGROUND => self.on_foreground(),
+            WM_APP_DOWNLOAD => {
+                // Na reunião ou com você fora, o pet fica quieto.
+                let jump = self.cfg.detect_downloads && !self.mood.frozen();
+                if cfg!(debug_assertions) {
+                    eprintln!("[atividade] download terminou; pula: {jump}");
+                }
+                if jump {
+                    self.play_once("jumping".into());
+                }
             }
             WM_APP_UPDATE => {
                 // SAFETY: post_update criou este Box e passou a posse pela mensagem.
@@ -1382,6 +1499,33 @@ impl App {
                 &format!("Tamanho… ({} px)", self.cfg.width),
             );
 
+            let detect_menu = CreatePopupMenu();
+            for (id, on, text) in [
+                (
+                    ID_DETECT_MEETING,
+                    self.cfg.detect_meeting,
+                    "Reunião (fica quieto com o microfone em uso)",
+                ),
+                (
+                    ID_DETECT_AWAY,
+                    self.cfg.detect_away,
+                    "Quando você sai (cochila e acena na volta)",
+                ),
+                (
+                    ID_DETECT_DOWNLOADS,
+                    self.cfg.detect_downloads,
+                    "Download terminado (dá um pulo)",
+                ),
+                (
+                    ID_DETECT_APPS,
+                    self.cfg.detect_apps,
+                    "Programando (corre no editor e no terminal)",
+                ),
+            ] {
+                append(detect_menu, MF_STRING | checked(on), id, text);
+            }
+            append_submenu(menu, detect_menu, "Perceber sozinho");
+
             append(
                 menu,
                 MF_STRING,
@@ -1472,6 +1616,18 @@ impl App {
                 self.cfg.save();
             }
             ID_SIZE_PANEL => return After::OpenSizePanel(self.cfg.width),
+            ID_DETECT_MEETING | ID_DETECT_AWAY | ID_DETECT_DOWNLOADS | ID_DETECT_APPS => {
+                let flag = match id {
+                    ID_DETECT_MEETING => &mut self.cfg.detect_meeting,
+                    ID_DETECT_AWAY => &mut self.cfg.detect_away,
+                    ID_DETECT_DOWNLOADS => &mut self.cfg.detect_downloads,
+                    _ => &mut self.cfg.detect_apps,
+                };
+                *flag = !*flag;
+                self.cfg.save();
+                self.check_away();
+                self.refresh_state();
+            }
             _ => {}
         }
         if let Some(error) = self.error.clone() {

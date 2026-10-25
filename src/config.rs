@@ -22,6 +22,11 @@ pub struct Config {
     pub installed_builtins: Vec<String>,
     /// O atalho da área de trabalho já foi criado uma vez; se o usuário apagar, não volta.
     pub desktop_shortcut_created: bool,
+    /// O que o pet percebe sozinho (`activity.rs`); cada um liga e desliga no menu.
+    pub detect_meeting: bool,
+    pub detect_away: bool,
+    pub detect_downloads: bool,
+    pub detect_apps: bool,
 }
 
 impl Default for Config {
@@ -36,6 +41,10 @@ impl Default for Config {
             check_updates: true,
             installed_builtins: Vec::new(),
             desktop_shortcut_created: false,
+            detect_meeting: true,
+            detect_away: true,
+            detect_downloads: true,
+            detect_apps: true,
         }
     }
 }
