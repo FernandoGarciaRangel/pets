@@ -1,6 +1,6 @@
 [package]
 name = "pets"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 description = "Pets do Codex flutuando em qualquer tela do Windows, reagindo ao Claude Code e ao Codex."
 license = "MIT"
