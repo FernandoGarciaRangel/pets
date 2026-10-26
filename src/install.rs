@@ -190,6 +190,73 @@ pub fn spawn_detached(exe: &Path, args: &[&str]) -> Result<(), String> {
         .map_err(|e| format!("não consegui iniciar o pet: {e}"))
 }
 
+/// Abrir o app de um exe solto (o `pets.exe` que ficou em Downloads depois do install) sobe a
+/// cópia instalada quando ela é igual ou mais nova, ou instala este exe por cima quando ele é o
+/// mais novo. Devolve se o app já foi iniciado a partir da cópia instalada.
+/// Why: o exe baixado não se atualiza junto; aberto de novo, subia a versão antiga dele.
+pub fn launch_installed() -> bool {
+    if cfg!(debug_assertions) {
+        return false;
+    }
+    let installed = installed_exe();
+    let Ok(me) = std::env::current_exe() else {
+        return false;
+    };
+    if !installed.is_file() || same_file(&me, &installed) {
+        return false;
+    }
+    let Some(mine) = file_version(&me) else {
+        return false;
+    };
+    // Cópia instalada sem versão é de antes da v0.5.2: este exe é o mais novo.
+    if file_version(&installed).is_some_and(|theirs| theirs >= mine) {
+        return spawn_detached(&installed, &[]).is_ok();
+    }
+    // Como numa atualização: só refaz os hooks que já existiam, sem desfazer um uninstall-hooks.
+    match install_app(true) {
+        Ok(_) => true,
+        Err(e) => {
+            crate::system::message_box(
+                &format!("Não consegui atualizar o Pets instalado: {e}"),
+                true,
+            );
+            false
+        }
+    }
+}
+
+/// `FILEVERSION` do `VERSIONINFO` (ver `pets.rc`), como (major, minor, patch, build).
+pub fn file_version(exe: &Path) -> Option<(u16, u16, u16, u16)> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FIXEDFILEINFO, VerQueryValueW,
+    };
+    let path: Vec<u16> = exe.as_os_str().encode_wide().chain([0]).collect();
+    let root: Vec<u16> = "\\".encode_utf16().chain([0]).collect();
+    // SAFETY: strings terminadas em NUL; o buffer tem o tamanho que o próprio Windows pediu, e o
+    // ponteiro devolvido por VerQueryValueW aponta para dentro dele.
+    unsafe {
+        let size = GetFileVersionInfoSizeW(path.as_ptr(), std::ptr::null_mut());
+        if size == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; size as usize];
+        if GetFileVersionInfoW(path.as_ptr(), 0, size, data.as_mut_ptr().cast()) == 0 {
+            return None;
+        }
+        let mut info: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut len = 0u32;
+        if VerQueryValueW(data.as_ptr().cast(), root.as_ptr(), &mut info, &mut len) == 0
+            || (len as usize) < size_of::<VS_FIXEDFILEINFO>()
+        {
+            return None;
+        }
+        let info = &*(info as *const VS_FIXEDFILEINFO);
+        let (ms, ls) = (info.dwFileVersionMS, info.dwFileVersionLS);
+        Some(((ms >> 16) as u16, ms as u16, (ls >> 16) as u16, ls as u16))
+    }
+}
+
 fn same_file(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
@@ -557,6 +624,15 @@ mod tests {
         let partial = merge(ORCA, &CLAUDE_EVENTS[..3], Some(CMD)).unwrap();
         assert!(!has_hooks(&partial, CLAUDE_EVENTS, CMD));
         assert!(!has_hooks("", CLAUDE_EVENTS, CMD));
+    }
+
+    #[test]
+    fn reads_the_file_version_of_an_exe() {
+        let windir = std::env::var_os("WINDIR").unwrap();
+        let notepad = PathBuf::from(windir).join("System32").join("notepad.exe");
+        // Não compara o número: para binários do sistema o Windows devolve uma versão de compatibilidade.
+        assert!(file_version(&notepad).is_some());
+        assert_eq!(file_version(Path::new(r"C:\nao\existe.exe")), None);
     }
 
     #[test]

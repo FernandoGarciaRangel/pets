@@ -52,6 +52,7 @@ fn main() {
                 "uso: pets [install | update | check-update | check-pets | update-pets | install-hooks | uninstall-hooks | hook <claude|codex>]"
             );
         }
+        _ if install::launch_installed() => {}
         _ => window::run(),
     }
 }

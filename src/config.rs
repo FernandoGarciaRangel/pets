@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub const MIN_WIDTH: u32 = 48;
@@ -18,8 +19,10 @@ pub struct Config {
     pub pets_dir: Option<PathBuf>,
     /// Procura versão nova no GitHub ao iniciar e a cada 6 h.
     pub check_updates: bool,
-    /// Pets embutidos já instalados uma vez; não são reinstalados se o usuário apagar.
-    pub installed_builtins: Vec<String>,
+    /// Pets embutidos já instalados uma vez (não voltam se o usuário apagar), com a impressão
+    /// digital da versão gravada (`builtin::sync`); vazia nos instalados antes da v0.5.2.
+    #[serde(deserialize_with = "builtins_list_or_map")]
+    pub installed_builtins: BTreeMap<String, String>,
     /// O atalho da área de trabalho já foi criado uma vez; se o usuário apagar, não volta.
     pub desktop_shortcut_created: bool,
     /// O que o pet percebe sozinho (`activity.rs`); cada um liga e desliga no menu.
@@ -39,7 +42,7 @@ impl Default for Config {
             visible: true,
             pets_dir: None,
             check_updates: true,
-            installed_builtins: Vec::new(),
+            installed_builtins: BTreeMap::new(),
             desktop_shortcut_created: false,
             detect_meeting: true,
             detect_away: true,
@@ -88,6 +91,22 @@ impl Config {
     }
 }
 
+/// Até a v0.5.1 era só a lista de ids.
+fn builtins_list_or_map<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Builtins {
+        Ids(Vec<String>),
+        Fingerprints(BTreeMap<String, String>),
+    }
+    Ok(match Builtins::deserialize(d)? {
+        Builtins::Ids(ids) => ids.into_iter().map(|id| (id, String::new())).collect(),
+        Builtins::Fingerprints(map) => map,
+    })
+}
+
 pub fn default_pets_dir() -> PathBuf {
     codex_home().join("pets")
 }
@@ -110,4 +129,21 @@ fn agent_home(var: &str, default: &str) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_old_builtin_list_and_round_trips_the_map() {
+        let old: Config = toml::from_str(r#"installed_builtins = ["draco"]"#).unwrap();
+        assert_eq!(old.installed_builtins["draco"], "");
+        let mut cfg = Config::default();
+        cfg.installed_builtins.insert("draco".into(), "abc".into());
+        let text = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.installed_builtins, cfg.installed_builtins);
+        assert!(back.visible);
+    }
 }

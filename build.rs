@@ -10,7 +10,15 @@ fn main() {
     // Ícone do app (a logo da raposa).
     println!("cargo:rerun-if-changed=pets.rc");
     println!("cargo:rerun-if-changed=assets/pets.ico");
-    embed_resource::compile("pets.rc", embed_resource::NONE)
+    // Versão no VERSIONINFO: um exe solto compara a dele com a da cópia instalada (`install.rs`).
+    let version: Vec<String> = ["MAJOR", "MINOR", "PATCH"]
+        .iter()
+        .map(|part| {
+            let value = std::env::var(format!("CARGO_PKG_VERSION_{part}")).unwrap();
+            format!("PETS_VERSION_{part}={value}")
+        })
+        .collect();
+    embed_resource::compile("pets.rc", &version)
         .manifest_required()
         .unwrap();
 }

@@ -1,2 +1,11 @@
 // Recursos do exe. O ícone 1 é o que o Explorer, a barra de tarefas e a bandeja usam.
 1 ICON "assets/pets.ico"
+
+// O build.rs define PETS_VERSION_* a partir do Cargo.toml.
+1 VERSIONINFO
+FILEVERSION PETS_VERSION_MAJOR, PETS_VERSION_MINOR, PETS_VERSION_PATCH, 0
+PRODUCTVERSION PETS_VERSION_MAJOR, PETS_VERSION_MINOR, PETS_VERSION_PATCH, 0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+END

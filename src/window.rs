@@ -520,9 +520,7 @@ fn checked(on: bool) -> u32 {
 impl App {
     fn new(hwnd: HWND) -> App {
         let mut cfg = Config::load();
-        let fresh = builtin::install_missing(&cfg.pets_dir(), &cfg.installed_builtins);
-        if !fresh.is_empty() {
-            cfg.installed_builtins.extend(fresh);
+        if builtin::sync(&cfg.pets_dir(), &mut cfg.installed_builtins) {
             cfg.save();
         }
         let pets = pets::discover(&cfg.pets_dir());
