@@ -290,6 +290,7 @@ fn is_ours(group: &Value) -> bool {
 
 /// O formato exato de `hook_command`, com qualquer pasta: `<...>/pets.exe hook <agente>`, com
 /// ou sem aspas. `codex-pets.exe hook` ou um script que só cita pets.exe não são nossos.
+/// O exe pode ter o nome que o navegador dá a um download repetido (`pets (1).exe`).
 fn is_our_hook(hook: &Value) -> bool {
     let Some(cmd) = hook["command"].as_str() else {
         return false;
@@ -307,10 +308,27 @@ fn is_our_hook(hook: &Value) -> bool {
     };
     let file = exe.rsplit(['/', '\\']).next().unwrap_or_default();
     let mut args = rest.split_whitespace();
-    file.eq_ignore_ascii_case("pets.exe")
+    is_pets_exe(file)
         && args.next().is_some_and(|a| a.eq_ignore_ascii_case("hook"))
         && args.next().is_some()
         && args.next().is_none()
+}
+
+/// `pets.exe`, ou `pets (N).exe` de quem baixou mais de uma vez e rodou direto do Downloads.
+fn is_pets_exe(file: &str) -> bool {
+    let file = file.to_ascii_lowercase();
+    let Some(stem) = file.strip_suffix(".exe") else {
+        return false;
+    };
+    let Some(copy) = stem.strip_prefix("pets") else {
+        return false;
+    };
+    let copy = copy.trim_start();
+    copy.is_empty()
+        || copy
+            .strip_prefix('(')
+            .and_then(|n| n.strip_suffix(')'))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Algum hook do pets no arquivo, apontando para qualquer exe.
@@ -449,7 +467,12 @@ mod tests {
         assert!(ours(
             r"C:\Users\x\AppData\Local\Programs\Pets\PETS.EXE hook claude"
         ));
+        assert!(ours(r#""D:/Downloads/pets (1).exe" hook claude"#));
+        assert!(ours("D:/Downloads/pets (12).exe hook codex"));
         assert!(!ours("C:/x/codex-pets.exe hook claude"));
+        assert!(!ours("C:/x/pets (a).exe hook claude"));
+        assert!(!ours("C:/x/pets ().exe hook claude"));
+        assert!(!ours("C:/x/petshop.exe hook claude"));
         assert!(!ours("C:/x/pets.exe hook"));
         assert!(!ours("C:/x/pets.exe hook claude --extra"));
         assert!(!ours("node run.js pets.exe hook claude"));
